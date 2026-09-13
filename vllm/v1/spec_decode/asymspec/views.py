@@ -97,6 +97,7 @@ class AsymSpecDraftViews:
                 vllm_config=draft_vllm_config,
                 model_config=self.speculative_config.draft_model_config,
                 load_config=self.speculative_config.draft_load_config,
+                prefix="asymspec_draft",
             )
         self.bind_model(model)
 

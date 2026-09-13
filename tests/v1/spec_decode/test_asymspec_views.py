@@ -97,6 +97,7 @@ def test_loads_one_physical_model_then_binds_both_views(monkeypatch):
     views.load_model()
 
     assert len(loads) == 1
+    assert loads[0]["prefix"] == "asymspec_draft"
     assert views.full is not None and views.base is not None
     assert views.full.model is views.base.model is physical_model
     with pytest.raises(RuntimeError, match="already been loaded"):
