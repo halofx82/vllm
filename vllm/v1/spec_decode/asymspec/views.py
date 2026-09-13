@@ -143,6 +143,9 @@ class AsymSpecDraftViews:
         self.full: AsymSpecView | None = None
         self.base: AsymSpecView | None = None
         self.load_memory: AsymSpecDraftLoadMemory | None = None
+        # Bound only by the later AsymSpec-local cache-binding stage. This is
+        # deliberately not a GPUModelRunner ``kv_caches`` entry.
+        self.draft_cache_bindings: object | None = None
 
     def _allocated_memory(self) -> int:
         return (

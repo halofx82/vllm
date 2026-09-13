@@ -17,21 +17,24 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.spec_decode.asymspec.cache_binding import (
+    bind_asymspec_draft_caches,
+)
 from vllm.v1.spec_decode.asymspec.cache_plan import (
     AsymSpecCacheDomain,
     build_asymspec_domain_allocation_plans,
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
 )
-from vllm.v1.spec_decode.asymspec.physical_cache import (
-    allocate_asymspec_physical_cache_tensors,
-    build_asymspec_physical_cache_plan,
-)
 from vllm.v1.spec_decode.asymspec.logical_cache import (
     AsymSpecLogicalCacheGroup,
     allocate_synthetic_attention_blocks,
     build_asymspec_logical_cache_plan,
     instantiate_asymspec_logical_block_pools,
+)
+from vllm.v1.spec_decode.asymspec.physical_cache import (
+    allocate_asymspec_physical_cache_tensors,
+    build_asymspec_physical_cache_plan,
 )
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
@@ -186,6 +189,20 @@ class _TestAttentionBackend:
     @staticmethod
     def customize_spec(spec):
         return spec
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [1]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"
+    ):
+        return (num_blocks, num_kv_heads, block_size, 2 * head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order():
+        return (0, 1, 2, 3)
 
 
 class _AttentionLayer(nn.Module, AttentionLayerBase):
@@ -1066,3 +1083,147 @@ def test_logical_block_pools_share_compressed_coordinates_not_storage():
         blocks = pool.get_new_blocks(3)
         assert [block.block_id for block in blocks] == [1, 2, 3]
         pool.free_blocks(blocks)
+
+
+def _build_bindable_draft_cache_runtime():
+    """Build the real 8/24 draft shape without a GPU or model forward."""
+    config = _make_config()
+    draft_model = _ManyLayerHybridModel(attention_layers=8, recurrent_layers=24)
+    target_model = _ManyLayerHybridModel(attention_layers=16, recurrent_layers=48)
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(draft_model)
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    target_specs = {
+        name: layer.get_kv_cache_spec(config)
+        for name, layer in target_model.named_modules()
+        if isinstance(layer, (AttentionLayerBase, MambaBase))
+    }
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+    domain_plans = build_asymspec_domain_allocation_plans(
+        global_plan=global_plan,
+        full_max_model_len=1024,
+        compressed_max_model_len=128,
+    )
+    physical_plan = build_asymspec_physical_cache_plan(
+        global_plan=global_plan, domain_plans=domain_plans
+    )
+    physical_runtime = allocate_asymspec_physical_cache_tensors(
+        plan=physical_plan, device=torch.device("cpu")
+    )
+    logical_runtime = instantiate_asymspec_logical_block_pools(
+        build_asymspec_logical_cache_plan(physical_plan)
+    )
+    return config, views, global_plan, physical_runtime, logical_runtime
+
+
+def test_draft_cache_binder_permanently_binds_distinct_full_and_base_trees():
+    config, views, global_plan, physical_runtime, logical_runtime = (
+        _build_bindable_draft_cache_runtime()
+    )
+    runtime = bind_asymspec_draft_caches(
+        views=views,
+        physical_runtime=physical_runtime,
+        global_plan=global_plan,
+        logical_pools=logical_runtime,
+        vllm_config=config,
+    )
+
+    assert len(runtime.bindings) == 64
+    assert len(runtime.full_bindings) == 32
+    assert len(runtime.base_bindings) == 32
+    assert runtime.logical_pools is logical_runtime
+    assert views.full.state.kv_state is runtime
+    assert views.base.state.kv_state is runtime
+
+    full_attention = next(
+        binding
+        for binding in runtime.full_bindings
+        if isinstance(binding.module, _AttentionLayer)
+    )
+    base_attention = next(
+        binding
+        for binding in runtime.base_bindings
+        if binding.physical_layer_name == full_attention.physical_layer_name
+    )
+    assert full_attention.module is not base_attention.module
+    assert full_attention.raw_tensor.data_ptr() != base_attention.raw_tensor.data_ptr()
+    assert full_attention.module.kv_cache.untyped_storage().data_ptr() == (
+        full_attention.raw_tensor.untyped_storage().data_ptr()
+    )
+    assert base_attention.module.kv_cache.untyped_storage().data_ptr() == (
+        base_attention.raw_tensor.untyped_storage().data_ptr()
+    )
+
+    full_mamba = next(
+        binding
+        for binding in runtime.full_bindings
+        if isinstance(binding.module, _GDNLayer)
+    )
+    base_mamba = next(
+        binding
+        for binding in runtime.base_bindings
+        if binding.physical_layer_name == full_mamba.physical_layer_name
+    )
+    assert full_mamba.module is not base_mamba.module
+    assert all(
+        state.untyped_storage().data_ptr()
+        == full_mamba.raw_tensor.untyped_storage().data_ptr()
+        for state in full_mamba.module.kv_cache
+    )
+    assert all(
+        state.untyped_storage().data_ptr()
+        == base_mamba.raw_tensor.untyped_storage().data_ptr()
+        for state in base_mamba.module.kv_cache
+    )
+    assert full_mamba.raw_tensor.data_ptr() != base_mamba.raw_tensor.data_ptr()
+
+    # TARGET allocations are deliberately not passed to any draft module.
+    target_names = {
+        allocation.global_layer_name
+        for allocation in physical_runtime.plan.tensors
+        if allocation.domain is AsymSpecCacheDomain.TARGET
+    }
+    assert not target_names.intersection(runtime.bindings)
+    assert (
+        bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=physical_runtime,
+            global_plan=global_plan,
+            logical_pools=logical_runtime,
+            vllm_config=config,
+        )
+        is runtime
+    )
+
+
+def test_draft_cache_binder_rejects_a_second_mismatched_runtime():
+    config, views, global_plan, physical_runtime, logical_runtime = (
+        _build_bindable_draft_cache_runtime()
+    )
+    bind_asymspec_draft_caches(
+        views=views,
+        physical_runtime=physical_runtime,
+        global_plan=global_plan,
+        logical_pools=logical_runtime,
+        vllm_config=config,
+    )
+    other_runtime = allocate_asymspec_physical_cache_tensors(
+        plan=physical_runtime.plan, device=torch.device("cpu")
+    )
+    with pytest.raises(RuntimeError, match="already permanently bound"):
+        bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=other_runtime,
+            global_plan=global_plan,
+            logical_pools=logical_runtime,
+            vllm_config=config,
+        )

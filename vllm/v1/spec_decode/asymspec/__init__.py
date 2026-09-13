@@ -30,6 +30,11 @@ from .physical_cache import (
     allocate_asymspec_physical_cache_tensors,
     build_asymspec_physical_cache_plan,
 )
+from .cache_binding import (
+    AsymSpecDraftCacheBinding,
+    AsymSpecDraftCacheBindingRuntime,
+    bind_asymspec_draft_caches,
+)
 from .views import (
     AsymSpecDraftLoadMemory,
     AsymSpecDraftViews,
@@ -39,6 +44,8 @@ from .views import (
 
 __all__ = [
     "AsymSpecDraftViews",
+    "AsymSpecDraftCacheBinding",
+    "AsymSpecDraftCacheBindingRuntime",
     "AsymSpecDraftLoadMemory",
     "AsymSpecAllocatorCompatibility",
     "AsymSpecCacheDomain",
@@ -60,6 +67,7 @@ __all__ = [
     "AsymSpecView",
     "AsymSpecViewRole",
     "allocate_asymspec_physical_cache_tensors",
+    "bind_asymspec_draft_caches",
     "allocate_synthetic_attention_blocks",
     "build_asymspec_logical_cache_plan",
     "build_asymspec_physical_cache_plan",
