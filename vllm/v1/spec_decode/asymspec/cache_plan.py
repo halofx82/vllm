@@ -36,6 +36,130 @@ class AsymSpecCachePlan:
     cache_groups: list[KVCacheGroupSpec]
 
 
+@dataclass(frozen=True)
+class AsymSpecCacheLayerBinding:
+    """The logical owner and physical source of one draft cache alias."""
+
+    role: AsymSpecViewRole
+    physical_layer_name: str
+
+
+@dataclass(frozen=True)
+class AsymSpecCacheNameRegistry:
+    """Reversible cache-name aliases for the two logical draft views.
+
+    The maps are authoritative: callers recover a role through ``binding_for``
+    rather than parsing a cache-layer name or depending on a group ID.
+    """
+
+    global_to_binding: dict[str, AsymSpecCacheLayerBinding]
+    role_physical_to_global: dict[tuple[AsymSpecViewRole, str], str]
+
+    @staticmethod
+    def _global_name(role: AsymSpecViewRole, physical_layer_name: str) -> str:
+        return f"__asymspec_cache__.{role.value}.{physical_layer_name}"
+
+    @classmethod
+    def create(
+        cls,
+        target_layer_names: set[str],
+        plans: tuple[AsymSpecCachePlan, AsymSpecCachePlan],
+    ) -> "AsymSpecCacheNameRegistry":
+        global_to_binding: dict[str, AsymSpecCacheLayerBinding] = {}
+        role_physical_to_global: dict[tuple[AsymSpecViewRole, str], str] = {}
+        for plan in plans:
+            for physical_layer_name in plan.layer_specs:
+                key = (plan.role, physical_layer_name)
+                global_name = cls._global_name(*key)
+                if global_name in target_layer_names:
+                    raise ValueError(
+                        "Target KV-cache layer name collides with reserved "
+                        f"AsymSpec namespace: {global_name!r}."
+                    )
+                if global_name in global_to_binding:
+                    raise ValueError(
+                        "AsymSpec cache-name collision for "
+                        f"{plan.role.value}:{physical_layer_name!r}."
+                    )
+                binding = AsymSpecCacheLayerBinding(*key)
+                global_to_binding[global_name] = binding
+                role_physical_to_global[key] = global_name
+        return cls(global_to_binding, role_physical_to_global)
+
+    def binding_for(self, global_name: str) -> AsymSpecCacheLayerBinding:
+        return self.global_to_binding[global_name]
+
+    def global_name_for(self, role: AsymSpecViewRole, physical_layer_name: str) -> str:
+        return self.role_physical_to_global[(role, physical_layer_name)]
+
+
+@dataclass(frozen=True)
+class AsymSpecGlobalCachePlan:
+    """Allocation-free engine-global cache-spec namespace for AsymSpec."""
+
+    merged_specs: dict[str, KVCacheSpec]
+    registry: AsymSpecCacheNameRegistry
+
+
+@dataclass(frozen=True)
+class AsymSpecNativeGroupingDiagnostic:
+    """Role composition observed from native, allocation-free grouping."""
+
+    group_roles: tuple[frozenset[str], ...]
+
+    @property
+    def role_separated(self) -> bool:
+        return all(len(roles) == 1 for roles in self.group_roles)
+
+
+def compose_asymspec_global_cache_plan(
+    *,
+    target_specs: dict[str, KVCacheSpec],
+    full_plan: AsymSpecCachePlan,
+    base_plan: AsymSpecCachePlan,
+) -> AsymSpecGlobalCachePlan:
+    """Compose target/FULL/BASE specs without mutating either role plan."""
+    if full_plan.role is not AsymSpecViewRole.FULL:
+        raise ValueError("AsymSpec FULL cache plan must have role FULL.")
+    if base_plan.role is not AsymSpecViewRole.BASE:
+        raise ValueError("AsymSpec BASE cache plan must have role BASE.")
+
+    registry = AsymSpecCacheNameRegistry.create(
+        set(target_specs), (full_plan, base_plan)
+    )
+    merged_specs = dict(target_specs)
+    for plan in (full_plan, base_plan):
+        for physical_layer_name, spec in plan.layer_specs.items():
+            global_name = registry.global_name_for(plan.role, physical_layer_name)
+            merged_specs[global_name] = spec
+    return AsymSpecGlobalCachePlan(merged_specs, registry)
+
+
+def diagnose_asymspec_native_grouping(
+    *,
+    global_plan: AsymSpecGlobalCachePlan,
+    vllm_config: VllmConfig,
+) -> AsymSpecNativeGroupingDiagnostic:
+    """Characterize whether native grouping preserves role boundaries.
+
+    The native helper can normalize its input mapping, so this intentionally
+    passes a fresh mapping. The global plan and role-owned plans stay intact.
+    """
+    groups = get_kv_cache_groups(vllm_config, dict(global_plan.merged_specs))
+    group_roles: list[frozenset[str]] = []
+    for group in groups:
+        roles = {
+            (
+                global_plan.registry.binding_for(layer_name).role.value
+                if layer_name in global_plan.registry.global_to_binding
+                else "target"
+            )
+            for layer_name in group.layer_names
+        }
+        group_roles.append(frozenset(roles))
+    return AsymSpecNativeGroupingDiagnostic(tuple(group_roles))
+
+
 def _layer_specs_from_model(
     model: Any,
     hybrid_spec: AsymSpecHybridStateSpec,

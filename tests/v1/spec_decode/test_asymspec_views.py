@@ -15,6 +15,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.spec_decode.asymspec.cache_plan import (
+    compose_asymspec_global_cache_plan,
+    diagnose_asymspec_native_grouping,
+)
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -245,3 +249,96 @@ def test_cache_plan_rejects_noncompact_mamba_metadata():
 
     with pytest.raises(ValueError, match="Mamba cache mode 'none'"):
         views.initialize_cache_plans()
+
+
+def test_global_cache_namespace_is_reversible_and_role_aware():
+    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+
+    target_specs = {
+        "target.layers.0.self_attn": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.bfloat16,
+        ),
+        "target.layers.1.linear_attn": MambaSpec(
+            block_size=256,
+            shapes=((4, 8), (2, 3, 5)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+            mamba_cache_mode="none",
+            num_speculative_blocks=2,
+        ),
+    }
+    full_layer_names_before = set(full_plan.layer_specs)
+    base_layer_names_before = set(base_plan.layer_specs)
+    global_plan = compose_asymspec_global_cache_plan(
+        target_specs=target_specs, full_plan=full_plan, base_plan=base_plan
+    )
+
+    full_name = global_plan.registry.global_name_for(
+        AsymSpecViewRole.FULL, "layers.0.self_attn"
+    )
+    base_name = global_plan.registry.global_name_for(
+        AsymSpecViewRole.BASE, "layers.0.self_attn"
+    )
+    assert set(target_specs).issubset(global_plan.merged_specs)
+    assert full_name != base_name
+    assert full_name not in target_specs and base_name not in target_specs
+    assert global_plan.registry.binding_for(full_name).role is AsymSpecViewRole.FULL
+    assert global_plan.registry.binding_for(base_name).role is AsymSpecViewRole.BASE
+    assert (
+        global_plan.registry.binding_for(full_name).physical_layer_name
+        == "layers.0.self_attn"
+    )
+    assert (
+        global_plan.merged_specs[full_name]
+        is full_plan.layer_specs["layers.0.self_attn"]
+    )
+    assert (
+        global_plan.merged_specs[base_name]
+        is base_plan.layer_specs["layers.0.self_attn"]
+    )
+    assert len(global_plan.merged_specs) == (
+        len(target_specs) + len(full_plan.layer_specs) + len(base_plan.layer_specs)
+    )
+    assert set(full_plan.layer_specs) == full_layer_names_before
+    assert set(base_plan.layer_specs) == base_layer_names_before
+    assert not hasattr(global_plan.registry, "cache_group_id")
+    with pytest.raises(ValueError, match="reserved AsymSpec namespace"):
+        compose_asymspec_global_cache_plan(
+            target_specs={full_name: target_specs["target.layers.0.self_attn"]},
+            full_plan=full_plan,
+            base_plan=base_plan,
+        )
+
+
+def test_native_grouping_is_role_mixed_for_equivalent_target_full_base_specs():
+    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    target_specs = {
+        f"target.{name}": spec for name, spec in full_plan.layer_specs.items()
+    }
+    global_plan = compose_asymspec_global_cache_plan(
+        target_specs=target_specs, full_plan=full_plan, base_plan=base_plan
+    )
+
+    diagnostic = diagnose_asymspec_native_grouping(
+        global_plan=global_plan, vllm_config=_make_config()
+    )
+
+    assert diagnostic.role_separated is False
+    assert any(
+        {"target", "full", "base"}.issubset(roles) for roles in diagnostic.group_roles
+    )
