@@ -23,6 +23,10 @@ from vllm.v1.spec_decode.asymspec.cache_plan import (
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
 )
+from vllm.v1.spec_decode.asymspec.physical_cache import (
+    allocate_asymspec_physical_cache_tensors,
+    build_asymspec_physical_cache_plan,
+)
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -742,3 +746,121 @@ def test_domain_allocation_plan_permits_different_pages_across_domains():
     assert {group.page_size_bytes for group in plans.target.groups} == {
         plans.target.page_size_bytes
     }
+
+
+def test_physical_cache_plan_is_one_independent_tensor_per_logical_layer():
+    """Physical ownership follows plans; it never uses generic sharing."""
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    model = _HybridQwenLikeModel()
+    views.bind_model(model)
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    target_specs = {
+        f"target.{name}": spec for name, spec in full_plan.layer_specs.items()
+    }
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+    domain_plans = build_asymspec_domain_allocation_plans(
+        global_plan=global_plan,
+        full_max_model_len=1024,
+        compressed_max_model_len=128,
+    )
+
+    physical_plan = build_asymspec_physical_cache_plan(
+        global_plan=global_plan, domain_plans=domain_plans
+    )
+    assert len(physical_plan.tensors) == len(global_plan.merged_specs) == 6
+    assert physical_plan.total_bytes == domain_plans.minimum_bytes
+    assert all(
+        allocation.kv_cache_tensor.shared_by == [allocation.global_layer_name]
+        for allocation in physical_plan.tensors
+    )
+    assert {
+        allocation.domain for allocation in physical_plan.tensors
+    } == set(AsymSpecCacheDomain)
+    for domain in AsymSpecCacheDomain:
+        assert physical_plan.bytes_for_domain(domain) == getattr(
+            domain_plans, domain.value
+        ).minimum_bytes
+
+    full_attn = next(
+        allocation
+        for allocation in physical_plan.tensors_for_domain(AsymSpecCacheDomain.FULL)
+        if isinstance(allocation.kv_cache_spec, FullAttentionSpec)
+    )
+    base_attn = next(
+        allocation
+        for allocation in physical_plan.tensors_for_domain(AsymSpecCacheDomain.BASE)
+        if isinstance(allocation.kv_cache_spec, FullAttentionSpec)
+    )
+    assert full_attn.physical_layer_name == base_attn.physical_layer_name
+    assert full_attn.global_layer_name != base_attn.global_layer_name
+    assert full_attn.num_pages == 65
+    assert base_attn.num_pages == 9
+    assert all(
+        not hasattr(allocation, "block_pool") for allocation in physical_plan.tensors
+    )
+
+
+def test_raw_physical_allocator_keeps_full_and_base_storage_distinct_on_cpu():
+    """The allocation primitive is unbound and has no generic cache side effect."""
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs={
+            f"target.{name}": spec for name, spec in full_plan.layer_specs.items()
+        },
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+    domain_plans = build_asymspec_domain_allocation_plans(
+        global_plan=global_plan,
+        full_max_model_len=128,
+        compressed_max_model_len=64,
+    )
+    physical_plan = build_asymspec_physical_cache_plan(
+        global_plan=global_plan, domain_plans=domain_plans
+    )
+
+    runtime = allocate_asymspec_physical_cache_tensors(
+        plan=physical_plan, device=torch.device("cpu")
+    )
+    assert set(runtime.raw_tensors) == {
+        allocation.global_layer_name for allocation in physical_plan.tensors
+    }
+    assert runtime.total_bytes == physical_plan.total_bytes
+    pointers = {
+        tensor.untyped_storage().data_ptr() for tensor in runtime.raw_tensors.values()
+    }
+    assert len(pointers) == len(runtime.raw_tensors)
+    full_name = next(
+        allocation.global_layer_name
+        for allocation in physical_plan.tensors_for_domain(AsymSpecCacheDomain.FULL)
+        if isinstance(allocation.kv_cache_spec, FullAttentionSpec)
+    )
+    base_name = next(
+        allocation.global_layer_name
+        for allocation in physical_plan.tensors_for_domain(AsymSpecCacheDomain.BASE)
+        if isinstance(allocation.kv_cache_spec, FullAttentionSpec)
+    )
+    assert (
+        runtime.raw_tensors[full_name].data_ptr()
+        != runtime.raw_tensors[base_name].data_ptr()
+    )
+    # This standalone object is deliberately not a normal model-runner cache.
+    assert not hasattr(runtime, "kv_caches")

@@ -14,6 +14,13 @@ from .cache_plan import (
     AsymSpecGlobalCachePlan,
 )
 from .hybrid import AsymSpecHybridStateSpec
+from .physical_cache import (
+    AsymSpecPhysicalCachePlan,
+    AsymSpecPhysicalCacheRuntime,
+    AsymSpecPhysicalCacheTensorPlan,
+    allocate_asymspec_physical_cache_tensors,
+    build_asymspec_physical_cache_plan,
+)
 from .views import AsymSpecDraftViews, AsymSpecView, AsymSpecViewRole
 
 __all__ = [
@@ -28,6 +35,11 @@ __all__ = [
     "AsymSpecCachePlan",
     "AsymSpecGlobalCachePlan",
     "AsymSpecHybridStateSpec",
+    "AsymSpecPhysicalCachePlan",
+    "AsymSpecPhysicalCacheRuntime",
+    "AsymSpecPhysicalCacheTensorPlan",
     "AsymSpecView",
     "AsymSpecViewRole",
+    "allocate_asymspec_physical_cache_tensors",
+    "build_asymspec_physical_cache_plan",
 ]
