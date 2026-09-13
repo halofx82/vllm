@@ -8,6 +8,9 @@ from .cache_plan import (
     AsymSpecCacheLayerBinding,
     AsymSpecCacheNameRegistry,
     AsymSpecCachePlan,
+    AsymSpecDomainAllocationPlan,
+    AsymSpecDomainAllocationPlans,
+    AsymSpecDomainGroupAllocationPlan,
     AsymSpecGlobalCachePlan,
 )
 from .hybrid import AsymSpecHybridStateSpec
@@ -17,6 +20,9 @@ __all__ = [
     "AsymSpecDraftViews",
     "AsymSpecAllocatorCompatibility",
     "AsymSpecCacheDomain",
+    "AsymSpecDomainAllocationPlan",
+    "AsymSpecDomainAllocationPlans",
+    "AsymSpecDomainGroupAllocationPlan",
     "AsymSpecCacheLayerBinding",
     "AsymSpecCacheNameRegistry",
     "AsymSpecCachePlan",

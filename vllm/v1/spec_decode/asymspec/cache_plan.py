@@ -10,6 +10,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
@@ -20,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 from .hybrid import AsymSpecHybridStateSpec
@@ -143,6 +145,79 @@ class AsymSpecAllocatorCompatibility:
     config_error: str | None
 
 
+@dataclass(frozen=True)
+class AsymSpecDomainGroupAllocationPlan:
+    """Minimum allocation geometry for one native cache group.
+
+    ``min_blocks_per_request`` includes the physical null block reserved by
+    vLLM's block pool.  It is therefore intentionally one larger than the
+    block-table width for token-addressed groups.  Compact Mamba groups are
+    bounded resident state: their physical count is independent of context
+    length.
+    """
+
+    domain: AsymSpecCacheDomain
+    layer_names: tuple[str, ...]
+    kv_cache_spec: KVCacheSpec
+    block_size: int
+    page_size_bytes: int
+    request_block_table_entries: int
+    min_blocks_per_request: int
+    minimum_bytes: int
+
+
+@dataclass(frozen=True)
+class AsymSpecDomainAllocationPlan:
+    """Allocation-free lower bound and geometry for one cache domain."""
+
+    domain: AsymSpecCacheDomain
+    max_tokens: int
+    page_size_bytes: int
+    groups: tuple[AsymSpecDomainGroupAllocationPlan, ...]
+    min_blocks_per_request: int
+    minimum_bytes: int
+
+    @property
+    def backing_pool_key(self) -> AsymSpecCacheDomain:
+        """Future allocators use this domain key for an independent pool."""
+        return self.domain
+
+
+@dataclass(frozen=True)
+class AsymSpecDomainAllocationPlans:
+    """Lower-bound allocation metadata for TARGET, FULL, and BASE.
+
+    This is deliberately not ``KVCacheConfig``.  It describes three future
+    backing pools, retains no runtime object, and leaves all memory beyond one
+    maximum-length request unassigned.
+    """
+
+    target: AsymSpecDomainAllocationPlan
+    full: AsymSpecDomainAllocationPlan
+    base: AsymSpecDomainAllocationPlan
+    available_memory_bytes: int | None
+
+    @property
+    def domains(self) -> tuple[AsymSpecDomainAllocationPlan, ...]:
+        return (self.target, self.full, self.base)
+
+    @property
+    def minimum_bytes(self) -> int:
+        return sum(domain.minimum_bytes for domain in self.domains)
+
+    @property
+    def remaining_unassigned_bytes(self) -> int | None:
+        if self.available_memory_bytes is None:
+            return None
+        return self.available_memory_bytes - self.minimum_bytes
+
+    @property
+    def has_minimum_capacity(self) -> bool | None:
+        if self.available_memory_bytes is None:
+            return None
+        return self.remaining_unassigned_bytes >= 0
+
+
 def compose_asymspec_global_cache_plan(
     *,
     vllm_config: VllmConfig,
@@ -202,6 +277,139 @@ def compose_asymspec_global_cache_plan(
         registry=registry,
         cache_groups=cache_groups,
         group_domains=group_domains,
+    )
+
+
+def _group_layer_specs(group: KVCacheGroupSpec) -> tuple[KVCacheSpec, ...]:
+    """Expand a native group to its physical per-layer specs."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return tuple(spec.kv_cache_specs[name] for name in group.layer_names)
+    return (spec,) * len(group.layer_names)
+
+
+def _minimum_blocks_for_group(
+    *,
+    group: KVCacheGroupSpec,
+    max_tokens: int,
+    domain: AsymSpecCacheDomain,
+) -> AsymSpecDomainGroupAllocationPlan:
+    """Mirror the frozen validated one-request asymmetric allocation rule."""
+    layer_specs = _group_layer_specs(group)
+    if len({spec.page_size_bytes for spec in layer_specs}) != 1:
+        raise ValueError(
+            "AsymSpec requires one physical page size per cache group; "
+            f"{domain.value} group {group.layer_names!r} is heterogeneous."
+        )
+    if len({spec.block_size for spec in layer_specs}) != 1:
+        raise ValueError(
+            "AsymSpec requires one native block size per cache group; "
+            f"{domain.value} group {group.layer_names!r} is heterogeneous."
+        )
+
+    spec = group.kv_cache_spec
+    if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "none":
+        # Validated compact semantics: one resident committed state, K
+        # speculative states, and one physical null block held by BlockPool.
+        request_entries = 1 + spec.num_speculative_blocks
+        min_blocks = 2 + spec.num_speculative_blocks
+    else:
+        request_entries = cdiv(max_tokens, spec.block_size)
+        mamba_checkpoint_blocks = (
+            spec.num_speculative_blocks if isinstance(spec, MambaSpec) else 0
+        )
+        # The frozen allocator reserves the physical null block in every
+        # token-addressed group and retains Mamba checkpoint blocks where
+        # native Mamba semantics require them.
+        min_blocks = request_entries + 1 + mamba_checkpoint_blocks
+
+    page_size = layer_specs[0].page_size_bytes
+    return AsymSpecDomainGroupAllocationPlan(
+        domain=domain,
+        layer_names=tuple(group.layer_names),
+        kv_cache_spec=spec,
+        block_size=spec.block_size,
+        page_size_bytes=page_size,
+        request_block_table_entries=request_entries,
+        min_blocks_per_request=min_blocks,
+        minimum_bytes=len(layer_specs) * page_size * min_blocks,
+    )
+
+
+def _build_domain_allocation_plan(
+    *,
+    domain: AsymSpecCacheDomain,
+    max_tokens: int,
+    groups: tuple[KVCacheGroupSpec, ...],
+) -> AsymSpecDomainAllocationPlan:
+    if max_tokens <= 0:
+        raise ValueError(f"AsymSpec {domain.value} max_tokens must be positive.")
+    if not groups:
+        raise ValueError(f"AsymSpec {domain.value} requires at least one cache group.")
+
+    group_plans = tuple(
+        _minimum_blocks_for_group(group=group, max_tokens=max_tokens, domain=domain)
+        for group in groups
+    )
+    page_sizes = {group.page_size_bytes for group in group_plans}
+    if len(page_sizes) != 1:
+        raise ValueError(
+            "AsymSpec requires compatible native page sizes within each "
+            f"domain; {domain.value} has {sorted(page_sizes)}."
+        )
+    return AsymSpecDomainAllocationPlan(
+        domain=domain,
+        max_tokens=max_tokens,
+        page_size_bytes=page_sizes.pop(),
+        groups=group_plans,
+        min_blocks_per_request=max(
+            group.min_blocks_per_request for group in group_plans
+        ),
+        minimum_bytes=sum(group.minimum_bytes for group in group_plans),
+    )
+
+
+def build_asymspec_domain_allocation_plans(
+    *,
+    global_plan: AsymSpecGlobalCachePlan,
+    full_max_model_len: int,
+    compressed_max_model_len: int,
+    available_memory_bytes: int | None = None,
+) -> AsymSpecDomainAllocationPlans:
+    """Plan independent TARGET/FULL/BASE lower bounds without allocation.
+
+    TARGET intentionally uses the compressed request budget, not the target
+    model's global ``max_model_len``.  The frozen SCALE1 allocator allocated
+    exactly these one-request minima and rejected insufficient memory; it did
+    not establish a validated policy for distributing surplus capacity.  This
+    planner therefore leaves surplus bytes explicitly unassigned.
+    """
+    if available_memory_bytes is not None and available_memory_bytes < 0:
+        raise ValueError("AsymSpec available KV memory cannot be negative.")
+    domain_groups = {
+        domain: tuple(
+            global_plan.cache_groups[index]
+            for index in global_plan.group_indices_for_domain(domain)
+        )
+        for domain in AsymSpecCacheDomain
+    }
+    return AsymSpecDomainAllocationPlans(
+        target=_build_domain_allocation_plan(
+            domain=AsymSpecCacheDomain.TARGET,
+            max_tokens=compressed_max_model_len,
+            groups=domain_groups[AsymSpecCacheDomain.TARGET],
+        ),
+        full=_build_domain_allocation_plan(
+            domain=AsymSpecCacheDomain.FULL,
+            max_tokens=full_max_model_len,
+            groups=domain_groups[AsymSpecCacheDomain.FULL],
+        ),
+        base=_build_domain_allocation_plan(
+            domain=AsymSpecCacheDomain.BASE,
+            max_tokens=compressed_max_model_len,
+            groups=domain_groups[AsymSpecCacheDomain.BASE],
+        ),
+        available_memory_bytes=available_memory_bytes,
     )
 
 

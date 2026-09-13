@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.spec_decode.asymspec.cache_plan import (
     AsymSpecCacheDomain,
+    build_asymspec_domain_allocation_plans,
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
 )
@@ -443,3 +444,123 @@ def test_global_cache_groups_are_role_separated_and_native_within_domains():
         assert compatibility.tensor_shares_domains is True
     else:
         assert compatibility.num_blocks is None
+
+
+def test_domain_allocation_plan_uses_independent_budgets_and_compact_mamba():
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    target_specs = {
+        f"target.{name}": spec for name, spec in full_plan.layer_specs.items()
+    }
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+
+    plans = build_asymspec_domain_allocation_plans(
+        global_plan=global_plan,
+        full_max_model_len=131072,
+        compressed_max_model_len=8192,
+        available_memory_bytes=1 << 40,
+    )
+
+    assert plans.full.max_tokens == 131072
+    assert plans.target.max_tokens == 8192
+    assert plans.base.max_tokens == 8192
+    assert plans.target.domain is AsymSpecCacheDomain.TARGET
+    assert plans.full.domain is AsymSpecCacheDomain.FULL
+    assert plans.base.domain is AsymSpecCacheDomain.BASE
+    assert {plan.backing_pool_key for plan in plans.domains} == {
+        AsymSpecCacheDomain.TARGET,
+        AsymSpecCacheDomain.FULL,
+        AsymSpecCacheDomain.BASE,
+    }
+
+    for domain_plan in plans.domains:
+        assert domain_plan.minimum_bytes == sum(
+            group.minimum_bytes for group in domain_plan.groups
+        )
+        assert {group.page_size_bytes for group in domain_plan.groups} == {
+            domain_plan.page_size_bytes
+        }
+        assert all(group.minimum_bytes > 0 for group in domain_plan.groups)
+        assert all(not hasattr(group, "block_pool") for group in domain_plan.groups)
+
+    full_attention = next(
+        group
+        for group in plans.full.groups
+        if isinstance(group.kv_cache_spec, FullAttentionSpec)
+    )
+    full_mamba = next(
+        group
+        for group in plans.full.groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    )
+    target_attention = next(
+        group
+        for group in plans.target.groups
+        if isinstance(group.kv_cache_spec, FullAttentionSpec)
+    )
+    target_mamba = next(
+        group
+        for group in plans.target.groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    )
+    assert full_attention.min_blocks_per_request == 8193
+    assert target_attention.min_blocks_per_request == 513
+    # Compact mode is bounded by committed + K state slots plus BlockPool's
+    # physical null block, rather than by 131072 / 4096 token positions.
+    assert full_mamba.request_block_table_entries == 3
+    assert full_mamba.min_blocks_per_request == 4
+    assert target_mamba.min_blocks_per_request == 4
+    assert plans.minimum_bytes == sum(plan.minimum_bytes for plan in plans.domains)
+    assert plans.has_minimum_capacity is True
+    assert plans.remaining_unassigned_bytes == (1 << 40) - plans.minimum_bytes
+
+
+def test_domain_allocation_plan_permits_different_pages_across_domains():
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    target_specs = {
+        "target.attn": FullAttentionSpec(
+            block_size=16, num_kv_heads=4, head_size=8, dtype=torch.bfloat16
+        ),
+        "target.mamba": MambaSpec(
+            block_size=256,
+            shapes=((4, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+            mamba_cache_mode="none",
+            num_speculative_blocks=2,
+        ),
+    }
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+    plans = build_asymspec_domain_allocation_plans(
+        global_plan=global_plan,
+        full_max_model_len=1024,
+        compressed_max_model_len=128,
+    )
+    assert plans.target.page_size_bytes != plans.full.page_size_bytes
+    assert plans.full.page_size_bytes == plans.base.page_size_bytes
+    assert {group.page_size_bytes for group in plans.target.groups} == {
+        plans.target.page_size_bytes
+    }
