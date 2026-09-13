@@ -105,6 +105,11 @@ def test_loads_one_physical_model_then_binds_both_views(monkeypatch):
     assert loads[0]["prefix"] == "asymspec_draft"
     assert views.full is not None and views.base is not None
     assert views.full.model is views.base.model is physical_model
+    # Loading weights establishes only the shared physical model and logical
+    # view identities.  Cache geometry is not valid until the platform has
+    # normalized hybrid block/page sizes.
+    assert views.full.state.cache_plan is None
+    assert views.base.state.cache_plan is None
     with pytest.raises(RuntimeError, match="already been loaded"):
         views.load_model()
 
@@ -243,6 +248,56 @@ def test_hybrid_cache_plans_are_role_owned_and_allocation_free():
     assert full.state.recurrent_state is base.state.recurrent_state is None
     assert full.state.position_state is base.state.position_state is None
     assert not hasattr(full_plan, "cache_group_id")
+
+
+def test_cache_plans_consume_post_normalization_geometry_only():
+    config = _make_config()
+    assert config.cache_config is not None
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+
+    # This is the state immediately after model load: plan ownership is
+    # pending, because backend normalization has not run yet.
+    full = views.view(AsymSpecViewRole.FULL)
+    base = views.view(AsymSpecViewRole.BASE)
+    assert full.state.cache_plan is None
+    assert base.state.cache_plan is None
+
+    # Model the normalized geometry supplied by
+    # Platform.update_block_size_for_backend().  The planner must consume
+    # these values rather than reconstructing pre-normalization geometry.
+    config.cache_config.block_size = 800
+    config.cache_config.mamba_page_size_padded = 51_200
+    views.initialize_cache_plans()
+
+    full_plan = full.state.cache_plan
+    base_plan = base.state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    for plan in (full_plan, base_plan):
+        attention_spec = plan.layer_specs["layers.0.self_attn"]
+        mamba_spec = plan.layer_specs["layers.1.linear_attn"]
+        assert isinstance(attention_spec, FullAttentionSpec)
+        assert isinstance(mamba_spec, MambaSpec)
+        assert attention_spec.block_size == 800
+        assert attention_spec.page_size_bytes == 51_200
+        assert mamba_spec.page_size_bytes == 51_200
+
+
+def test_model_runner_finalizes_only_existing_asymspec_views():
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+    runner = SimpleNamespace(asymspec_draft_views=views)
+
+    GPUModelRunner.initialize_asymspec_cache_plans(runner)
+    assert views.view(AsymSpecViewRole.FULL).state.cache_plan is not None
+
+    ordinary_runner = SimpleNamespace()
+    # The model-runner hook is a no-op when no AsymSpec views exist; executor
+    # paths additionally avoid calling it for ordinary speculative methods.
+    GPUModelRunner.initialize_asymspec_cache_plans(ordinary_runner)
 
 
 def test_cache_plan_rejects_noncompact_mamba_metadata():

@@ -379,6 +379,11 @@ class RayDistributedExecutor(Executor):
             current_platform.update_block_size_for_backend(worker.vllm_config)
 
         self.collective_rpc(_update_block_size)
+        if (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.method == "asymspec"
+        ):
+            self.collective_rpc("initialize_asymspec_cache_plans")
 
         for pp_rank in range(self.parallel_config.pipeline_parallel_size):
             self.pp_tp_workers.append([])

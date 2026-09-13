@@ -3444,6 +3444,20 @@ class GPUModelRunner(
 
         self.asymspec_draft_views = AsymSpecDraftViews(self.vllm_config, self.device)
 
+    def initialize_asymspec_cache_plans(self) -> None:
+        """Finalize AsymSpec cache metadata after backend normalization.
+
+        ``Platform.update_block_size_for_backend`` mutates the worker cache
+        configuration for hybrid attention/GDN models.  The FULL and BASE
+        plans must be derived only after that common native normalization has
+        completed; this method is deliberately invoked by the executor at
+        that lifecycle point, not while loading model weights.
+        """
+        asymspec_views = getattr(self, "asymspec_draft_views", None)
+        if asymspec_views is None:
+            return
+        asymspec_views.initialize_cache_plans()
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -5457,7 +5471,6 @@ class GPUModelRunner(
                 if hasattr(self, "asymspec_draft_views"):
                     self.asymspec_draft_views.load_model()
                     self.asymspec_draft_views.initialize_state_specs()
-                    self.asymspec_draft_views.initialize_cache_plans()
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):

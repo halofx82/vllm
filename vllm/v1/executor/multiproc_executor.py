@@ -689,6 +689,11 @@ class WorkerProc:
 
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.method == "asymspec"
+        ):
+            self.worker.initialize_asymspec_cache_plans()
 
         # Initialize message queues after init_device() since multi-node setups
         # (nnodes_within_dp > 1) require distributed groups to be initialized

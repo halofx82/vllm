@@ -73,6 +73,11 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+        if (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.method == "asymspec"
+        ):
+            self.driver_worker.initialize_asymspec_cache_plans()
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""

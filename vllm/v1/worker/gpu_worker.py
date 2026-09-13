@@ -649,6 +649,15 @@ class Worker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def initialize_asymspec_cache_plans(self) -> None:
+        """Finalize AsymSpec-only cache metadata after backend setup.
+
+        Executors call this only for ``method=\"asymspec\"`` immediately
+        after ``Platform.update_block_size_for_backend``.  It owns no cache
+        blocks and is intentionally absent from the ordinary vLLM lifecycle.
+        """
+        self.model_runner.initialize_asymspec_cache_plans()
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine
