@@ -63,6 +63,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+AsymSpecTypes = Literal["asymspec"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -76,6 +77,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    AsymSpecTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -299,6 +301,15 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
+    # AsymSpec configuration. Runtime support is introduced incrementally; keep
+    # this surface limited to the validated production choices.
+    asymspec_compressed_max_model_len: int | None = Field(default=None, ge=1)
+    """Maximum sequence length for AsymSpec's compressed BASE/target context."""
+    asymspec_full_prefill_chunk_tokens: int = Field(default=8192, ge=1)
+    """Number of FULL-context prompt tokens processed per prefill chunk."""
+    asymspec_evidence_mode: Literal["off", "one_shot"] = "off"
+    """Whether to use one-shot long-context evidence transfer."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -321,6 +332,14 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        if self.method == "asymspec":
+            factors.extend(
+                (
+                    self.asymspec_compressed_max_model_len,
+                    self.asymspec_full_prefill_chunk_tokens,
+                    self.asymspec_evidence_mode,
+                )
+            )
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -932,7 +951,13 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "dspark",
+                    "asymspec",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -973,7 +998,7 @@ class SpeculativeConfig:
                             "multiple times of forward on same MTP layer"
                             ",which may result in lower acceptance rate"
                         )
-                elif self.method == "draft_model":
+                elif self.method in ("draft_model", "asymspec"):
                     pass
                 else:
                     raise NotImplementedError(
@@ -1343,6 +1368,26 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.method == "asymspec":
+            if self.model is None:
+                raise ValueError("method='asymspec' requires a draft model.")
+            if self.num_speculative_tokens != 2:
+                raise ValueError(
+                    "method='asymspec' currently requires num_speculative_tokens=2."
+                )
+            if self.asymspec_compressed_max_model_len is None:
+                raise ValueError(
+                    "method='asymspec' requires asymspec_compressed_max_model_len."
+                )
+            if (
+                self.target_model_config is not None
+                and self.asymspec_compressed_max_model_len
+                > self.target_model_config.max_model_len
+            ):
+                raise ValueError(
+                    "asymspec_compressed_max_model_len cannot exceed the "
+                    "target model's max_model_len."
+                )
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
@@ -1402,7 +1447,7 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method == "draft_model"
+            self.method in ("draft_model", "asymspec")
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
@@ -1490,7 +1535,7 @@ class SpeculativeConfig:
         return self.num_speculative_tokens_per_batch_size is not None
 
     def uses_draft_model(self) -> bool:
-        return self.method == "draft_model"
+        return self.method in ("draft_model", "asymspec")
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
