@@ -18,6 +18,12 @@ from .cache_plan import (
     AsymSpecDomainGroupAllocationPlan,
     AsymSpecGlobalCachePlan,
 )
+from .execution_metadata import (
+    AsymSpecMetadataGroup,
+    AsymSpecViewExecutionMetadata,
+    build_asymspec_view_execution_metadata,
+    recurrent_page_ids,
+)
 from .hybrid import AsymSpecHybridStateSpec
 from .logical_cache import (
     AsymSpecLogicalBlockPoolRuntime,
@@ -56,6 +62,7 @@ __all__ = [
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",
     "AsymSpecDraftLoadMemory",
+    "AsymSpecMetadataGroup",
     "AsymSpecAllocatorCompatibility",
     "AsymSpecCacheDomain",
     "AsymSpecDomainAllocationPlan",
@@ -74,6 +81,7 @@ __all__ = [
     "AsymSpecPhysicalCacheRuntime",
     "AsymSpecPhysicalCacheTensorPlan",
     "AsymSpecView",
+    "AsymSpecViewExecutionMetadata",
     "AsymSpecViewRole",
     "AsymSpecBaseCoordinates",
     "AsymSpecCompressedCoordinates",
@@ -86,6 +94,8 @@ __all__ = [
     "allocate_synthetic_attention_blocks",
     "build_asymspec_logical_cache_plan",
     "build_asymspec_physical_cache_plan",
+    "build_asymspec_view_execution_metadata",
     "instantiate_asymspec_logical_block_pools",
     "create_asymspec_request_state",
+    "recurrent_page_ids",
 ]

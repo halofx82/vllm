@@ -313,7 +313,6 @@ def create_asymspec_request_state(
         )
         recurrent_ids = {
             group: [
-                recurrent_slots[group].null_block_id,
                 recurrent_slots[group].committed_block_id,
                 *recurrent_slots[group].speculative_block_ids,
             ]

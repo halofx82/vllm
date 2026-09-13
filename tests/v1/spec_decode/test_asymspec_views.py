@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm.v1.spec_decode.asymspec.execution_metadata as execution_metadata_module
 import vllm.v1.spec_decode.asymspec.views as views_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -25,6 +26,10 @@ from vllm.v1.spec_decode.asymspec.cache_plan import (
     build_asymspec_domain_allocation_plans,
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
+)
+from vllm.v1.spec_decode.asymspec.execution_metadata import (
+    build_asymspec_view_execution_metadata,
+    recurrent_page_ids,
 )
 from vllm.v1.spec_decode.asymspec.logical_cache import (
     AsymSpecLogicalCacheGroup,
@@ -1144,6 +1149,11 @@ def test_request_state_keeps_full_and_deferred_base_coordinates_independent():
         assert slots.committed_block_id == 1
         assert slots.speculative_block_ids == (2, 3)
         assert tables.table_by_group[group].slot_mapping_mode.name == "NONE"
+        assert tables.table_by_group[group].block_table.np[0, :3].tolist() == [
+            1,
+            2,
+            3,
+        ]
 
     state.release()
     assert all(
@@ -1167,9 +1177,20 @@ def test_request_state_requires_a_valid_augmented_full_coordinate_mapping():
         )
 
 
-def _build_bindable_draft_cache_runtime():
+def _build_bindable_draft_cache_runtime(
+    *,
+    full_max_model_len: int = 1024,
+    compressed_max_model_len: int = 128,
+    attention_block_size: int | None = None,
+):
     """Build the real 8/24 draft shape without a GPU or model forward."""
     config = _make_config()
+    config.model_config.max_model_len = full_max_model_len
+    config.speculative_config.asymspec_compressed_max_model_len = (
+        compressed_max_model_len
+    )
+    if attention_block_size is not None:
+        config.cache_config.block_size = attention_block_size
     draft_model = _ManyLayerHybridModel(attention_layers=8, recurrent_layers=24)
     target_model = _ManyLayerHybridModel(attention_layers=16, recurrent_layers=48)
     views = AsymSpecDraftViews(config, torch.device("cpu"))
@@ -1192,8 +1213,8 @@ def _build_bindable_draft_cache_runtime():
     )
     domain_plans = build_asymspec_domain_allocation_plans(
         global_plan=global_plan,
-        full_max_model_len=1024,
-        compressed_max_model_len=128,
+        full_max_model_len=full_max_model_len,
+        compressed_max_model_len=compressed_max_model_len,
     )
     physical_plan = build_asymspec_physical_cache_plan(
         global_plan=global_plan, domain_plans=domain_plans
@@ -1309,3 +1330,212 @@ def test_draft_cache_binder_rejects_a_second_mismatched_runtime():
             logical_pools=logical_runtime,
             vllm_config=config,
         )
+
+
+class _MetadataOnlyBuilder:
+    """Avoid backend-specific execution in allocation-free metadata tests."""
+
+    def build(self, *, common_attn_metadata, **kwargs):
+        return common_attn_metadata
+
+
+def _bind_metadata_test_runtime(
+    *,
+    full_max_model_len: int = 3200,
+    compressed_max_model_len: int = 1602,
+):
+    config, views, global_plan, physical_runtime, logical_runtime = (
+        _build_bindable_draft_cache_runtime(
+            full_max_model_len=full_max_model_len,
+            compressed_max_model_len=compressed_max_model_len,
+            attention_block_size=800,
+        )
+    )
+    bindings = bind_asymspec_draft_caches(
+        views=views,
+        physical_runtime=physical_runtime,
+        global_plan=global_plan,
+        logical_pools=logical_runtime,
+        vllm_config=config,
+    )
+    return config, views, physical_runtime, logical_runtime, bindings
+
+
+def test_execution_metadata_keeps_full_and_base_resources_role_local(monkeypatch):
+    monkeypatch.setattr(
+        execution_metadata_module,
+        "_new_metadata_builder",
+        lambda **_: _MetadataOnlyBuilder(),
+    )
+    config, views, physical_runtime, logical_runtime, bindings = (
+        _bind_metadata_test_runtime()
+    )
+    state = create_asymspec_request_state(
+        request_id="metadata-role-local",
+        compressed_prompt_len=1602,
+        full_prompt_len=3200,
+        augmentation_offset=1598,
+        logical_pools=logical_runtime,
+    )
+    storage_before = {
+        name: tensor.untyped_storage().data_ptr()
+        for name, tensor in physical_runtime.raw_tensors.items()
+    }
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("metadata construction must not execute a draft model")
+
+    monkeypatch.setattr(views.full.model, "forward", fail_if_called)
+    monkeypatch.setattr(views.base.model, "forward", fail_if_called)
+
+    full = build_asymspec_view_execution_metadata(
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+        role=AsymSpecViewRole.FULL,
+        query_start=799,
+        query_len=3,
+        device=torch.device("cpu"),
+    )
+    base = build_asymspec_view_execution_metadata(
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+        role=AsymSpecViewRole.BASE,
+        query_start=799,
+        query_len=3,
+        device=torch.device("cpu"),
+    )
+
+    assert set(full.groups) == {
+        AsymSpecLogicalCacheGroup.FULL_ATTENTION,
+        AsymSpecLogicalCacheGroup.FULL_MAMBA_A,
+        AsymSpecLogicalCacheGroup.FULL_MAMBA_B,
+    }
+    assert set(base.groups) == {
+        AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION,
+        AsymSpecLogicalCacheGroup.BASE_MAMBA_A,
+        AsymSpecLogicalCacheGroup.BASE_MAMBA_B,
+    }
+    assert (
+        full.groups[AsymSpecLogicalCacheGroup.FULL_ATTENTION].block_table.data_ptr()
+        == state.block_tables.full_attention_table.block_table.gpu.data_ptr()
+    )
+    assert (
+        base.groups[
+            AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
+        ].block_table.data_ptr()
+        == state.block_tables.compressed_attention_table.block_table.gpu.data_ptr()
+    )
+    assert full.positions.tolist() == [799, 800, 801]
+    assert base.positions.tolist() == [799, 800, 801]
+    assert full.attention_block_ids.tolist() == [1, 2, 2]
+    assert base.attention_block_ids.tolist() == [1, 2, 2]
+    assert full.attention_slot_mapping.tolist() == [1599, 1600, 1601]
+    assert base.attention_slot_mapping.tolist() == [1599, 1600, 1601]
+    assert all(
+        recurrent_page_ids(group.recurrent_slots) == (0, 1, 2, 3)
+        for group in full.groups.values()
+        if group.recurrent_slots is not None
+    )
+    assert all(
+        recurrent_page_ids(group.recurrent_slots) == (0, 1, 2, 3)
+        for group in base.groups.values()
+        if group.recurrent_slots is not None
+    )
+    # Frozen compact GDN semantics anchor state metadata at the canonical
+    # boundary, not at the end of a temporary query span.
+    assert all(
+        group.metadata.seq_lens.tolist() == [799]
+        for group in full.groups.values()
+        if group.recurrent_slots is not None
+    )
+    assert all(
+        group.metadata.seq_lens.tolist() == [799]
+        for group in base.groups.values()
+        if group.recurrent_slots is not None
+    )
+    assert storage_before == {
+        name: tensor.untyped_storage().data_ptr()
+        for name, tensor in physical_runtime.raw_tensors.items()
+    }
+    state.release()
+
+
+@pytest.mark.parametrize(
+    ("query_start", "expected_blocks", "expected_slots"),
+    [
+        (799, [1, 2, 2], [1599, 1600, 1601]),
+        (1599, [2, 3, 3], [2399, 2400, 2401]),
+    ],
+)
+def test_execution_metadata_uses_native_attention_block_boundaries(
+    monkeypatch, query_start, expected_blocks, expected_slots
+):
+    monkeypatch.setattr(
+        execution_metadata_module,
+        "_new_metadata_builder",
+        lambda **_: _MetadataOnlyBuilder(),
+    )
+    config, views, _, logical_runtime, bindings = _bind_metadata_test_runtime()
+    state = create_asymspec_request_state(
+        request_id=f"metadata-boundary-{query_start}",
+        compressed_prompt_len=1602,
+        full_prompt_len=3200,
+        augmentation_offset=1598,
+        logical_pools=logical_runtime,
+    )
+    metadata = build_asymspec_view_execution_metadata(
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+        role=AsymSpecViewRole.BASE,
+        query_start=query_start,
+        query_len=3,
+        device=torch.device("cpu"),
+    )
+    assert metadata.attention_block_ids.tolist() == expected_blocks
+    assert metadata.attention_slot_mapping.tolist() == expected_slots
+    state.release()
+
+
+def test_execution_metadata_represents_deferred_base_catchup(monkeypatch):
+    monkeypatch.setattr(
+        execution_metadata_module,
+        "_new_metadata_builder",
+        lambda **_: _MetadataOnlyBuilder(),
+    )
+    config, views, _, logical_runtime, bindings = _bind_metadata_test_runtime(
+        full_max_model_len=1024,
+        compressed_max_model_len=128,
+    )
+    state = create_asymspec_request_state(
+        request_id="metadata-base-lag",
+        compressed_prompt_len=96,
+        full_prompt_len=1024,
+        augmentation_offset=928,
+        logical_pools=logical_runtime,
+    )
+    state.advance_target([11, 12, 13, 14])
+    assert state.base.canonical_len == 96
+    assert state.base.observed_len == 100
+    full_before = state.full.canonical_len
+    metadata = build_asymspec_view_execution_metadata(
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+        role=AsymSpecViewRole.BASE,
+        query_start=96,
+        query_len=4,
+        canonical_end=96,
+        device=torch.device("cpu"),
+    )
+    assert metadata.positions.tolist() == [96, 97, 98, 99]
+    assert metadata.canonical_end == 96
+    assert metadata.attention_block_ids.tolist() == [1, 1, 1, 1]
+    assert state.full.canonical_len == full_before
+    assert state.base.pending_token_ids == [11, 12, 13, 14]
+    state.release()
