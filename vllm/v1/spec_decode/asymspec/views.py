@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared physical draft model and logical AsymSpec views.
+"""Shared-weight draft model trees and logical AsymSpec views.
 
 This module deliberately contains no cache allocation or proposal logic. It
 only establishes the ownership boundary required by later AsymSpec stages:
-one loaded draft model, with independent FULL and BASE runtime identities.
+one checkpoint-backed FULL draft tree plus a structurally independent BASE
+tree whose parameters and persistent buffers alias FULL storage.
 """
 
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ import torch.nn as nn
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.utils import initialize_model
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from .hybrid import AsymSpecHybridStateSpec, describe_qwen3_5_hybrid_state
 
@@ -49,15 +52,81 @@ class AsymSpecViewState:
 
 @dataclass
 class AsymSpecView:
-    """A logical view over the one physical AsymSpec draft model."""
+    """A logical AsymSpec view backed by its own draft module tree."""
 
     role: AsymSpecViewRole
     model: nn.Module
     state: AsymSpecViewState = field(default_factory=AsymSpecViewState)
 
 
+@dataclass(frozen=True)
+class AsymSpecDraftLoadMemory:
+    """Per-worker memory checkpoints for the shared-weight construction."""
+
+    before_full_load: int
+    after_full_load: int
+    after_base_tree: int
+    after_state_aliasing: int
+
+
+def _module_and_leaf(root: nn.Module, qualified_name: str) -> tuple[nn.Module, str]:
+    parent_name, _, leaf = qualified_name.rpartition(".")
+    return (root.get_submodule(parent_name) if parent_name else root), leaf
+
+
+def share_model_state(full: nn.Module, base: nn.Module) -> tuple[int, int]:
+    """Alias BASE parameters/buffers to FULL without sharing module objects.
+
+    ``base`` is created on ``meta`` during real loading, so assigning FULL's
+    tensors is its only model-state materialization. Runtime/cache attributes
+    are not parameters or persistent buffers and deliberately remain local to
+    each module tree.
+    """
+    full_params = dict(full.named_parameters(remove_duplicate=False))
+    base_params = dict(base.named_parameters(remove_duplicate=False))
+    if full_params.keys() != base_params.keys():
+        mismatch = sorted(full_params.keys() ^ base_params.keys())[:16]
+        raise RuntimeError("AsymSpec FULL/BASE parameter layouts differ: "
+                           f"{mismatch!r}")
+
+    parameter_bytes = 0
+    seen_params: set[int] = set()
+    for name, full_param in full_params.items():
+        parent, leaf = _module_and_leaf(base, name)
+        parent._parameters[leaf] = full_param
+        if id(full_param) not in seen_params:
+            parameter_bytes += full_param.numel() * full_param.element_size()
+            seen_params.add(id(full_param))
+
+    full_buffers = dict(full.named_buffers(remove_duplicate=False))
+    base_buffers = dict(base.named_buffers(remove_duplicate=False))
+    if full_buffers.keys() != base_buffers.keys():
+        mismatch = sorted(full_buffers.keys() ^ base_buffers.keys())[:16]
+        raise RuntimeError("AsymSpec FULL/BASE buffer layouts differ: "
+                           f"{mismatch!r}")
+
+    buffer_bytes = 0
+    seen_buffers: set[int] = set()
+    for name, full_buffer in full_buffers.items():
+        parent, leaf = _module_and_leaf(base, name)
+        parent._buffers[leaf] = full_buffer
+        if id(full_buffer) not in seen_buffers:
+            buffer_bytes += full_buffer.numel() * full_buffer.element_size()
+            seen_buffers.add(id(full_buffer))
+
+    rebound_params = dict(base.named_parameters(remove_duplicate=False))
+    rebound_buffers = dict(base.named_buffers(remove_duplicate=False))
+    for name, full_param in full_params.items():
+        if rebound_params[name] is not full_param:
+            raise RuntimeError(f"AsymSpec parameter sharing failed: {name}")
+    for name, full_buffer in full_buffers.items():
+        if rebound_buffers[name] is not full_buffer:
+            raise RuntimeError(f"AsymSpec buffer sharing failed: {name}")
+    return parameter_bytes, buffer_bytes
+
+
 class AsymSpecDraftViews:
-    """Own one physical draft model and expose FULL and BASE logical views."""
+    """Own shared-weight FULL/BASE trees with independent runtime identity."""
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         speculative_config = vllm_config.speculative_config
@@ -69,9 +138,18 @@ class AsymSpecDraftViews:
         self.vllm_config = vllm_config
         self.device = device
         self.speculative_config = speculative_config
+        # ``model`` remains the FULL tree for existing draft-model accessors.
         self.model: nn.Module | None = None
         self.full: AsymSpecView | None = None
         self.base: AsymSpecView | None = None
+        self.load_memory: AsymSpecDraftLoadMemory | None = None
+
+    def _allocated_memory(self) -> int:
+        return (
+            torch.cuda.memory_allocated(self.device)
+            if self.device.type == "cuda"
+            else 0
+        )
 
     def _create_draft_vllm_config(self) -> VllmConfig:
         """Create the normal external-draft loading config once."""
@@ -87,11 +165,12 @@ class AsymSpecDraftViews:
         )
 
     def load_model(self) -> None:
-        """Load the physical draft weights once, then bind both logical views."""
+        """Load FULL once and construct a shared-storage BASE module tree."""
         if self.model is not None:
             raise RuntimeError("AsymSpec draft model has already been loaded.")
 
         draft_vllm_config = self._create_draft_vllm_config()
+        before_full_load = self._allocated_memory()
         with set_model_tag("asymspec_draft"):
             model = get_model(
                 vllm_config=draft_vllm_config,
@@ -99,30 +178,63 @@ class AsymSpecDraftViews:
                 load_config=self.speculative_config.draft_load_config,
                 prefix="asymspec_draft",
             )
-        self.bind_model(model)
+        after_full_load = self._allocated_memory()
+        with set_model_tag("asymspec_base"):
+            with set_default_torch_dtype(
+                    getattr(draft_vllm_config.model_config, "dtype", torch.bfloat16)):
+                with torch.device("meta"):
+                    base_model = initialize_model(
+                        vllm_config=draft_vllm_config,
+                        model_config=self.speculative_config.draft_model_config,
+                        prefix="asymspec_base",
+                    )
+        after_base_tree = self._allocated_memory()
+        self.bind_models(model, base_model)
+        self.load_memory = AsymSpecDraftLoadMemory(
+            before_full_load=before_full_load,
+            after_full_load=after_full_load,
+            after_base_tree=after_base_tree,
+            after_state_aliasing=self._allocated_memory(),
+        )
 
     def bind_model(self, model: nn.Module) -> None:
-        """Bind one physical model to distinct FULL and BASE view identities."""
+        """Test-only convenience constructor for a structural BASE clone.
+
+        Real loading uses :meth:`bind_models` with a meta-constructed BASE
+        tree; this helper keeps synthetic unit fixtures concise.
+        """
+        import copy
+
+        self.bind_models(model, copy.deepcopy(model))
+
+    def bind_models(self, full_model: nn.Module, base_model: nn.Module) -> None:
+        """Bind distinct FULL/BASE trees after aliasing their model state."""
         if self.model is not None:
             raise RuntimeError("AsymSpec draft model has already been bound.")
 
-        self.model = model
-        self.full = AsymSpecView(AsymSpecViewRole.FULL, model)
-        self.base = AsymSpecView(AsymSpecViewRole.BASE, model)
+        share_model_state(full_model, base_model)
+        self.model = full_model
+        self.full = AsymSpecView(AsymSpecViewRole.FULL, full_model)
+        self.base = AsymSpecView(AsymSpecViewRole.BASE, base_model)
         assert self.full is not self.base
-        assert self.full.model is self.base.model is self.model
+        assert self.full.model is self.model
+        assert self.full.model is not self.base.model
 
     def owns_physical_module(self, module: nn.Module) -> bool:
-        """Return whether ``module`` belongs to the one physical draft tree.
+        """Return whether ``module`` belongs to either draft module tree.
 
         The compilation static-forward context intentionally retains both the
         target and draft modules.  AsymSpec uses this identity boundary when
         collecting TARGET cache specs: draft modules belong exclusively to the
         logical FULL and BASE cache plans, never to TARGET.
         """
-        if self.model is None:
+        if self.model is None or self.base is None:
             raise RuntimeError("AsymSpec draft model is unavailable before model load.")
-        return any(candidate is module for candidate in self.model.modules())
+        return any(
+            candidate is module
+            for model in (self.model, self.base.model)
+            for candidate in model.modules()
+        )
 
     def initialize_state_specs(self) -> None:
         """Attach independent, allocation-free hybrid state descriptions."""
@@ -131,13 +243,13 @@ class AsymSpecDraftViews:
                 "AsymSpec draft views are unavailable before model load."
             )
 
-        # Build separate descriptor objects: the physical layers remain shared,
-        # while each logical role owns its future KV/GDN/position state.
+        # Build descriptors from separate module trees. Weight storage is
+        # shared; all future KV/GDN/position state remains role-local.
         self.full.state.hybrid_spec = describe_qwen3_5_hybrid_state(
-            self.model, self.speculative_config.num_speculative_tokens
+            self.full.model, self.speculative_config.num_speculative_tokens
         )
         self.base.state.hybrid_spec = describe_qwen3_5_hybrid_state(
-            self.model, self.speculative_config.num_speculative_tokens
+            self.base.model, self.speculative_config.num_speculative_tokens
         )
         assert self.full.state.hybrid_spec is not self.base.state.hybrid_spec
 
@@ -166,14 +278,14 @@ class AsymSpecDraftViews:
         self.full.state.cache_plan = build_asymspec_cache_plan(
             role=AsymSpecViewRole.FULL,
             max_model_len=self.vllm_config.model_config.max_model_len,
-            model=self.model,
+            model=self.full.model,
             hybrid_spec=self.full.state.hybrid_spec,
             draft_vllm_config=draft_vllm_config,
         )
         self.base.state.cache_plan = build_asymspec_cache_plan(
             role=AsymSpecViewRole.BASE,
             max_model_len=compressed_max_model_len,
-            model=self.model,
+            model=self.base.model,
             hybrid_spec=self.base.state.hybrid_spec,
             draft_vllm_config=draft_vllm_config,
         )

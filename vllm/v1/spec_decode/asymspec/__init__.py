@@ -30,10 +30,16 @@ from .physical_cache import (
     allocate_asymspec_physical_cache_tensors,
     build_asymspec_physical_cache_plan,
 )
-from .views import AsymSpecDraftViews, AsymSpecView, AsymSpecViewRole
+from .views import (
+    AsymSpecDraftLoadMemory,
+    AsymSpecDraftViews,
+    AsymSpecView,
+    AsymSpecViewRole,
+)
 
 __all__ = [
     "AsymSpecDraftViews",
+    "AsymSpecDraftLoadMemory",
     "AsymSpecAllocatorCompatibility",
     "AsymSpecCacheDomain",
     "AsymSpecDomainAllocationPlan",

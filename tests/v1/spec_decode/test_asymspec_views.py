@@ -36,6 +36,7 @@ from vllm.v1.spec_decode.asymspec.logical_cache import (
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
+    share_model_state,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -82,11 +83,12 @@ def _make_config(method: str = "asymspec") -> _VllmConfig:
     )
 
 
-def test_full_and_base_are_distinct_views_of_one_physical_model():
+def test_full_and_base_are_distinct_trees_with_shared_model_storage():
     views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
-    physical_model = nn.Linear(4, 4, bias=False)
+    full_model = nn.Linear(4, 4, bias=False)
+    base_model = nn.Linear(4, 4, bias=False)
 
-    views.bind_model(physical_model)
+    views.bind_models(full_model, base_model)
 
     full = views.view(AsymSpecViewRole.FULL)
     base = views.view(AsymSpecViewRole.BASE)
@@ -94,11 +96,37 @@ def test_full_and_base_are_distinct_views_of_one_physical_model():
     assert full.role is AsymSpecViewRole.FULL
     assert base.role is AsymSpecViewRole.BASE
     assert full.state is not base.state
-    assert full.model is base.model is physical_model
+    assert full.model is full_model
+    assert base.model is base_model
+    assert full.model is not base.model
     assert full.model.weight.data_ptr() == base.model.weight.data_ptr()
 
 
-def test_loads_one_physical_model_then_binds_both_views(monkeypatch):
+def test_shared_state_leaves_runtime_attributes_tree_local():
+    class _Tree(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4, bias=False)
+            self.register_buffer("persistent", torch.ones(2))
+            self.kv_cache = object()
+            self.runtime_state = {"position": 0}
+
+    full = _Tree()
+    base = _Tree()
+    parameter_bytes, buffer_bytes = share_model_state(full, base)
+
+    assert parameter_bytes == full.proj.weight.numel() * full.proj.weight.element_size()
+    assert buffer_bytes == full.persistent.numel() * full.persistent.element_size()
+    assert full is not base
+    assert full.proj is not base.proj
+    assert full.proj.weight is base.proj.weight
+    assert full.proj.weight.data_ptr() == base.proj.weight.data_ptr()
+    assert full.persistent is base.persistent
+    assert full.kv_cache is not base.kv_cache
+    assert full.runtime_state is not base.runtime_state
+
+
+def test_loads_one_checkpoint_model_then_builds_shared_storage_base(monkeypatch):
     views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
     physical_model = nn.Linear(4, 4, bias=False)
     loads: list[object] = []
@@ -107,15 +135,22 @@ def test_loads_one_physical_model_then_binds_both_views(monkeypatch):
         loads.append(kwargs)
         return physical_model
 
+    base_model = nn.Linear(4, 4, bias=False, device="meta")
+
     monkeypatch.setattr(views_module, "get_model", load_once)
+    monkeypatch.setattr(views_module, "initialize_model", lambda **_: base_model)
     monkeypatch.setattr(views_module, "set_model_tag", lambda _: nullcontext())
+    monkeypatch.setattr(views_module, "set_default_torch_dtype", lambda _: nullcontext())
 
     views.load_model()
 
     assert len(loads) == 1
     assert loads[0]["prefix"] == "asymspec_draft"
     assert views.full is not None and views.base is not None
-    assert views.full.model is views.base.model is physical_model
+    assert views.full.model is physical_model
+    assert views.base.model is base_model
+    assert views.full.model is not views.base.model
+    assert views.full.model.weight.data_ptr() == views.base.model.weight.data_ptr()
     # Loading weights establishes only the shared physical model and logical
     # view identities.  Cache geometry is not valid until the platform has
     # normalized hybrid block/page sizes.
@@ -322,7 +357,10 @@ def test_hybrid_specs_are_role_owned_and_allocation_free():
     assert full_spec.recurrent[0].shapes == ((4, 8), (2, 3, 5))
     assert full_spec.recurrent[0].dtypes == (torch.bfloat16, torch.float32)
     assert full_spec.compact_recurrent_state_slots == 3
-    assert full.model is base.model is model
+    assert full.model is model
+    assert full.model is not base.model
+    assert full.model.layers[0].self_attn is not base.model.layers[0].self_attn
+    assert full.model.layers[1].linear_attn is not base.model.layers[1].linear_attn
     assert full.state.kv_state is base.state.kv_state is None
     assert full.state.recurrent_state is base.state.recurrent_state is None
     assert full.state.position_state is base.state.position_state is None
@@ -376,7 +414,10 @@ def test_hybrid_cache_plans_are_role_owned_and_allocation_free():
         group is not other
         for group, other in zip(full_plan.cache_groups, base_plan.cache_groups)
     )
-    assert full.model is base.model is model
+    assert full.model is model
+    assert full.model is not base.model
+    assert full.model.layers[0].self_attn is not base.model.layers[0].self_attn
+    assert full.model.layers[1].linear_attn is not base.model.layers[1].linear_attn
     assert full.state.kv_state is base.state.kv_state is None
     assert full.state.recurrent_state is base.state.recurrent_state is None
     assert full.state.position_state is base.state.position_state is None
