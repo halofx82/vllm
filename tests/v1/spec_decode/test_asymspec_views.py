@@ -27,6 +27,10 @@ from vllm.v1.spec_decode.asymspec.cache_plan import (
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
 )
+from vllm.v1.spec_decode.asymspec.draft_forward import (
+    execute_asymspec_draft_forward,
+    qwen3_5_text_positions,
+)
 from vllm.v1.spec_decode.asymspec.execution_metadata import (
     build_asymspec_view_execution_metadata,
     recurrent_page_ids,
@@ -266,6 +270,85 @@ class _ManyLayerHybridModel(nn.Module):
             else:
                 layer.linear_attn = _GDNLayer()
             self.layers.append(layer)
+
+
+class _ForwardModel(nn.Module):
+    def __init__(self, bias: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(bias))
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        del inputs_embeds
+        self.calls.append((input_ids, positions))
+        return input_ids.to(torch.float32).unsqueeze(-1) + self.weight
+
+    def compute_logits(self, hidden_states):
+        return hidden_states
+
+
+def test_draft_dispatcher_selects_only_the_requested_tree(monkeypatch):
+    """Role-local metadata is installed only around its selected tree call."""
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    full_model = _ForwardModel(1.0)
+    base_model = _ForwardModel(2.0)
+    views.bind_models(full_model, base_model)
+    marker = SimpleNamespace(runtime=object())
+    views.draft_cache_bindings = marker
+    metadata = SimpleNamespace(
+        role=AsymSpecViewRole.FULL,
+        query_len=2,
+        positions=torch.tensor([3, 4]),
+        layer_metadata={"full": object()},
+        layer_slot_mapping={"full": torch.tensor([3, 4])},
+    )
+    contexts = []
+
+    class _Context:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *args):
+            return False
+
+    def record_context(attn_metadata, vllm_config, **kwargs):
+        contexts.append((attn_metadata, vllm_config, kwargs))
+        return _Context()
+
+    import vllm.v1.spec_decode.asymspec.draft_forward as forward_module
+
+    monkeypatch.setattr(forward_module, "set_forward_context", record_context)
+    result = execute_asymspec_draft_forward(
+        role=AsymSpecViewRole.FULL,
+        input_ids=torch.tensor([9, 10], dtype=torch.int32),
+        metadata=metadata,
+        views=views,
+        cache_bindings=marker.runtime,
+    )
+
+    assert result.role is AsymSpecViewRole.FULL
+    assert result.logits.tolist() == [[11.0]]
+    assert len(full_model.calls) == 1
+    assert not base_model.calls
+    assert full_model.calls[0][1].tolist() == [[3, 4], [3, 4], [3, 4]]
+    assert contexts == [
+        (
+            metadata.layer_metadata,
+            config,
+            {"num_tokens": 2, "slot_mapping": metadata.layer_slot_mapping},
+        )
+    ]
+
+
+def test_qwen3_5_text_positions_rejects_non_vector_coordinates():
+    assert qwen3_5_text_positions(torch.tensor([1, 2])).tolist() == [
+        [1, 2],
+        [1, 2],
+        [1, 2],
+    ]
+    with pytest.raises(ValueError, match="one-dimensional"):
+        qwen3_5_text_positions(torch.ones((1, 2), dtype=torch.int64))
 
 
 def _make_kv_spec_runner(config, views):

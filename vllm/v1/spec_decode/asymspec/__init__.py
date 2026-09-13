@@ -18,6 +18,12 @@ from .cache_plan import (
     AsymSpecDomainGroupAllocationPlan,
     AsymSpecGlobalCachePlan,
 )
+from .draft_forward import (
+    AsymSpecDraftForwardResult,
+    execute_asymspec_draft_forward,
+    initialize_fresh_asymspec_view_state,
+    qwen3_5_text_positions,
+)
 from .execution_metadata import (
     AsymSpecMetadataGroup,
     AsymSpecViewExecutionMetadata,
@@ -59,6 +65,7 @@ from .views import (
 
 __all__ = [
     "AsymSpecDraftViews",
+    "AsymSpecDraftForwardResult",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",
     "AsymSpecDraftLoadMemory",
@@ -97,5 +104,8 @@ __all__ = [
     "build_asymspec_view_execution_metadata",
     "instantiate_asymspec_logical_block_pools",
     "create_asymspec_request_state",
+    "execute_asymspec_draft_forward",
+    "initialize_fresh_asymspec_view_state",
+    "qwen3_5_text_positions",
     "recurrent_page_ids",
 ]
