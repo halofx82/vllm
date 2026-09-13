@@ -36,6 +36,9 @@ from vllm.v1.spec_decode.asymspec.physical_cache import (
     allocate_asymspec_physical_cache_tensors,
     build_asymspec_physical_cache_plan,
 )
+from vllm.v1.spec_decode.asymspec.request_state import (
+    create_asymspec_request_state,
+)
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -1083,6 +1086,85 @@ def test_logical_block_pools_share_compressed_coordinates_not_storage():
         blocks = pool.get_new_blocks(3)
         assert [block.block_id for block in blocks] == [1, 2, 3]
         pool.free_blocks(blocks)
+
+
+def test_request_state_keeps_full_and_deferred_base_coordinates_independent():
+    """Request-local tables retain frozen FULL/BASE coordinate ownership."""
+    physical_plan = _build_large_asymspec_physical_plan()
+    logical_runtime = instantiate_asymspec_logical_block_pools(
+        build_asymspec_logical_cache_plan(physical_plan)
+    )
+    state = create_asymspec_request_state(
+        request_id="synthetic-request",
+        compressed_prompt_len=96,
+        full_prompt_len=960,
+        augmentation_offset=864,
+        logical_pools=logical_runtime,
+    )
+
+    tables = state.block_tables
+    assert tables.target_attention_table is tables.base_attention_table
+    assert tables.full_attention_table is not tables.compressed_attention_table
+    assert state.compressed.canonical_len == state.base.canonical_len == 96
+    assert state.base.observed_len == 96
+    assert state.full.canonical_len == 960
+    assert state.full.position_for_compressed(96) == 960
+
+    compressed_ids = tables.attention_block_ids(
+        AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
+    )
+    full_ids = tables.attention_block_ids(AsymSpecLogicalCacheGroup.FULL_ATTENTION)
+    assert compressed_ids == tuple(range(1, 7))
+    assert full_ids == tuple(range(1, 61))
+
+    assert list(state.advance_target([101, 102, 103, 104])) == list(range(96, 100))
+    assert state.compressed.canonical_len == 100
+    assert state.base.canonical_len == 96
+    assert state.base.observed_len == 100
+    assert state.base.pending_token_ids == [101, 102, 103, 104]
+    assert list(state.advance_full(4)) == list(range(960, 964))
+    assert state.full.canonical_len == 964
+    assert state.compressed.canonical_len == 100
+    assert tables.target_attention_table is tables.base_attention_table
+
+    assert state.catch_up_base() == (101, 102, 103, 104)
+    assert state.base.canonical_len == state.compressed.canonical_len == 100
+    assert state.base.pending_token_ids == []
+
+    assert set(tables.recurrent_slots) == {
+        AsymSpecLogicalCacheGroup.TARGET_MAMBA_A,
+        AsymSpecLogicalCacheGroup.TARGET_MAMBA_B,
+        AsymSpecLogicalCacheGroup.BASE_MAMBA_A,
+        AsymSpecLogicalCacheGroup.BASE_MAMBA_B,
+        AsymSpecLogicalCacheGroup.FULL_MAMBA_A,
+        AsymSpecLogicalCacheGroup.FULL_MAMBA_B,
+    }
+    for group, slots in tables.recurrent_slots.items():
+        assert slots.null_block_id == 0
+        assert slots.committed_block_id == 1
+        assert slots.speculative_block_ids == (2, 3)
+        assert tables.table_by_group[group].slot_mapping_mode.name == "NONE"
+
+    state.release()
+    assert all(
+        pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+        for pool in logical_runtime.pools.values()
+    )
+
+
+def test_request_state_requires_a_valid_augmented_full_coordinate_mapping():
+    physical_plan = _build_large_asymspec_physical_plan()
+    logical_runtime = instantiate_asymspec_logical_block_pools(
+        build_asymspec_logical_cache_plan(physical_plan)
+    )
+    with pytest.raises(ValueError, match="augmentation offset"):
+        create_asymspec_request_state(
+            request_id="bad-offset",
+            compressed_prompt_len=128,
+            full_prompt_len=1024,
+            augmentation_offset=895,
+            logical_pools=logical_runtime,
+        )
 
 
 def _build_bindable_draft_cache_runtime():
