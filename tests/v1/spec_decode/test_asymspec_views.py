@@ -27,6 +27,12 @@ from vllm.v1.spec_decode.asymspec.physical_cache import (
     allocate_asymspec_physical_cache_tensors,
     build_asymspec_physical_cache_plan,
 )
+from vllm.v1.spec_decode.asymspec.logical_cache import (
+    AsymSpecLogicalCacheGroup,
+    allocate_synthetic_attention_blocks,
+    build_asymspec_logical_cache_plan,
+    instantiate_asymspec_logical_block_pools,
+)
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -864,3 +870,158 @@ def test_raw_physical_allocator_keeps_full_and_base_storage_distinct_on_cpu():
     )
     # This standalone object is deliberately not a normal model-runner cache.
     assert not hasattr(runtime, "kv_caches")
+
+
+def _build_large_asymspec_physical_plan():
+    """Build a CPU-only stand-in for the real 64/32/32 cache inventory."""
+    config = _make_config()
+    draft_model = _ManyLayerHybridModel(attention_layers=8, recurrent_layers=24)
+    target_model = _ManyLayerHybridModel(attention_layers=16, recurrent_layers=48)
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(draft_model)
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    target_specs = {
+        name: layer.get_kv_cache_spec(config)
+        for name, layer in target_model.named_modules()
+        if isinstance(layer, (AttentionLayerBase, MambaBase))
+    }
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+    domain_plans = build_asymspec_domain_allocation_plans(
+        global_plan=global_plan,
+        full_max_model_len=1024,
+        compressed_max_model_len=128,
+    )
+    return build_asymspec_physical_cache_plan(
+        global_plan=global_plan, domain_plans=domain_plans
+    )
+
+
+def test_logical_cache_plan_reproduces_eight_semantic_pool_topology():
+    physical_plan = _build_large_asymspec_physical_plan()
+    logical_plan = build_asymspec_logical_cache_plan(physical_plan)
+
+    assert [group.semantic_group for group in logical_plan.groups] == [
+        AsymSpecLogicalCacheGroup.TARGET_MAMBA_A,
+        AsymSpecLogicalCacheGroup.TARGET_MAMBA_B,
+        AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION,
+        AsymSpecLogicalCacheGroup.FULL_ATTENTION,
+        AsymSpecLogicalCacheGroup.BASE_MAMBA_A,
+        AsymSpecLogicalCacheGroup.FULL_MAMBA_A,
+        AsymSpecLogicalCacheGroup.BASE_MAMBA_B,
+        AsymSpecLogicalCacheGroup.FULL_MAMBA_B,
+    ]
+    groups = {group.semantic_group: group for group in logical_plan.groups}
+    assert (
+        len(groups[AsymSpecLogicalCacheGroup.TARGET_MAMBA_A].member_layer_names)
+        == 24
+    )
+    assert (
+        len(groups[AsymSpecLogicalCacheGroup.TARGET_MAMBA_B].member_layer_names)
+        == 24
+    )
+    assert (
+        len(
+            groups[AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION].member_layer_names
+        )
+        == 24
+    )
+    assert len(groups[AsymSpecLogicalCacheGroup.FULL_ATTENTION].member_layer_names) == 8
+    assert len(groups[AsymSpecLogicalCacheGroup.BASE_MAMBA_A].member_layer_names) == 12
+    assert len(groups[AsymSpecLogicalCacheGroup.BASE_MAMBA_B].member_layer_names) == 12
+    assert len(groups[AsymSpecLogicalCacheGroup.FULL_MAMBA_A].member_layer_names) == 12
+    assert len(groups[AsymSpecLogicalCacheGroup.FULL_MAMBA_B].member_layer_names) == 12
+
+    compressed = groups[AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION]
+    full_attention = groups[AsymSpecLogicalCacheGroup.FULL_ATTENTION]
+    assert compressed.domains == {
+        AsymSpecCacheDomain.TARGET,
+        AsymSpecCacheDomain.BASE,
+    }
+    assert compressed.intentionally_shared_coordinates is True
+    assert full_attention.domains == {AsymSpecCacheDomain.FULL}
+    assert full_attention.intentionally_shared_coordinates is False
+    assert set(logical_plan.layer_to_group) == {
+        allocation.global_layer_name for allocation in physical_plan.tensors
+    }
+
+
+def test_logical_block_pools_share_compressed_coordinates_not_storage():
+    physical_plan = _build_large_asymspec_physical_plan()
+    logical_plan = build_asymspec_logical_cache_plan(physical_plan)
+    runtime = instantiate_asymspec_logical_block_pools(logical_plan)
+
+    assert len(runtime.pools) == 8
+    assert len({id(pool) for pool in runtime.pools.values()}) == 8
+    compressed_pool = runtime.pools[AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION]
+    full_pool = runtime.pools[AsymSpecLogicalCacheGroup.FULL_ATTENTION]
+    assert compressed_pool is not full_pool
+    assert compressed_pool.enable_caching is False
+    assert compressed_pool.null_block.block_id == 0
+
+    compressed_group = next(
+        group
+        for group in logical_plan.groups
+        if group.semantic_group is AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
+    )
+    target_attention_name = next(
+        name
+        for name in compressed_group.member_layer_names
+        if logical_plan.physical_tensors_by_layer[name].domain
+        is AsymSpecCacheDomain.TARGET
+    )
+    base_attention_name = next(
+        name
+        for name in compressed_group.member_layer_names
+        if logical_plan.physical_tensors_by_layer[name].domain
+        is AsymSpecCacheDomain.BASE
+    )
+    assert runtime.pool_for_layer(target_attention_name) is compressed_pool
+    assert runtime.pool_for_layer(base_attention_name) is compressed_pool
+
+    physical_runtime = allocate_asymspec_physical_cache_tensors(
+        plan=physical_plan, device=torch.device("cpu")
+    )
+    assert (
+        physical_runtime.raw_tensors[target_attention_name].data_ptr()
+        != physical_runtime.raw_tensors[base_attention_name].data_ptr()
+    )
+
+    compressed_ids = allocate_synthetic_attention_blocks(
+        runtime, AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION, 128
+    )
+    full_ids = allocate_synthetic_attention_blocks(
+        runtime, AsymSpecLogicalCacheGroup.FULL_ATTENTION, 1024
+    )
+    assert compressed_ids == tuple(range(1, 9))
+    assert full_ids == tuple(range(1, 65))
+    compressed_pool.free_blocks(
+        compressed_pool.blocks[block_id] for block_id in compressed_ids
+    )
+    full_pool.free_blocks(full_pool.blocks[block_id] for block_id in full_ids)
+
+    recurrent_pools = [
+        runtime.pools[group]
+        for group in (
+            AsymSpecLogicalCacheGroup.TARGET_MAMBA_A,
+            AsymSpecLogicalCacheGroup.TARGET_MAMBA_B,
+            AsymSpecLogicalCacheGroup.BASE_MAMBA_A,
+            AsymSpecLogicalCacheGroup.BASE_MAMBA_B,
+            AsymSpecLogicalCacheGroup.FULL_MAMBA_A,
+            AsymSpecLogicalCacheGroup.FULL_MAMBA_B,
+        )
+    ]
+    assert all(pool.num_gpu_blocks == 4 for pool in recurrent_pools)
+    assert all(pool.null_block.block_id == 0 for pool in recurrent_pools)
+    for pool in recurrent_pools:
+        blocks = pool.get_new_blocks(3)
+        assert [block.block_id for block in blocks] == [1, 2, 3]
+        pool.free_blocks(blocks)
