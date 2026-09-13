@@ -3,6 +3,8 @@
 """Native AsymSpec components."""
 
 from .cache_plan import (
+    AsymSpecAllocatorCompatibility,
+    AsymSpecCacheDomain,
     AsymSpecCacheLayerBinding,
     AsymSpecCacheNameRegistry,
     AsymSpecCachePlan,
@@ -13,6 +15,8 @@ from .views import AsymSpecDraftViews, AsymSpecView, AsymSpecViewRole
 
 __all__ = [
     "AsymSpecDraftViews",
+    "AsymSpecAllocatorCompatibility",
+    "AsymSpecCacheDomain",
     "AsymSpecCacheLayerBinding",
     "AsymSpecCacheNameRegistry",
     "AsymSpecCachePlan",

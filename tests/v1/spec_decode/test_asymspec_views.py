@@ -14,10 +14,12 @@ import vllm.v1.spec_decode.asymspec.views as views_module
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.spec_decode.asymspec.cache_plan import (
+    AsymSpecCacheDomain,
+    characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
-    diagnose_asymspec_native_grouping,
 )
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
@@ -39,6 +41,7 @@ class _VllmConfig:
     quant_config: object | None = None
     cache_config: object | None = None
     scheduler_config: object | None = None
+    kv_transfer_config: object | None = None
 
 
 def _make_config(method: str = "asymspec") -> _VllmConfig:
@@ -55,6 +58,7 @@ def _make_config(method: str = "asymspec") -> _VllmConfig:
         mamba_block_size=256,
         mamba_page_size_padded=None,
         mamba_cache_mode="none",
+        num_gpu_blocks_override=None,
     )
     scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
     return _VllmConfig(
@@ -253,7 +257,8 @@ def test_cache_plan_rejects_noncompact_mamba_metadata():
 
 
 def test_global_cache_namespace_is_reversible_and_role_aware():
-    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
     views.bind_model(_HybridQwenLikeModel())
     views.initialize_state_specs()
     views.initialize_cache_plans()
@@ -280,8 +285,26 @@ def test_global_cache_namespace_is_reversible_and_role_aware():
     full_layer_names_before = set(full_plan.layer_specs)
     base_layer_names_before = set(base_plan.layer_specs)
     global_plan = compose_asymspec_global_cache_plan(
-        target_specs=target_specs, full_plan=full_plan, base_plan=base_plan
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
     )
+
+    native_target_groups = get_kv_cache_groups(config, dict(target_specs))
+    target_indices = global_plan.group_indices_for_domain(AsymSpecCacheDomain.TARGET)
+    composed_target_layer_names = [
+        global_plan.cache_groups[index].layer_names for index in target_indices
+    ]
+    assert composed_target_layer_names == [
+        group.layer_names for group in native_target_groups
+    ]
+    composed_target_specs = [
+        global_plan.cache_groups[index].kv_cache_spec for index in target_indices
+    ]
+    assert composed_target_specs == [
+        group.kv_cache_spec for group in native_target_groups
+    ]
 
     full_name = global_plan.registry.global_name_for(
         AsymSpecViewRole.FULL, "layers.0.self_attn"
@@ -314,14 +337,16 @@ def test_global_cache_namespace_is_reversible_and_role_aware():
     assert not hasattr(global_plan.registry, "cache_group_id")
     with pytest.raises(ValueError, match="reserved AsymSpec namespace"):
         compose_asymspec_global_cache_plan(
+            vllm_config=_make_config(),
             target_specs={full_name: target_specs["target.layers.0.self_attn"]},
             full_plan=full_plan,
             base_plan=base_plan,
         )
 
 
-def test_native_grouping_is_role_mixed_for_equivalent_target_full_base_specs():
-    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+def test_global_cache_groups_are_role_separated_and_native_within_domains():
+    config = _make_config()
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
     views.bind_model(_HybridQwenLikeModel())
     views.initialize_state_specs()
     views.initialize_cache_plans()
@@ -331,15 +356,90 @@ def test_native_grouping_is_role_mixed_for_equivalent_target_full_base_specs():
     target_specs = {
         f"target.{name}": spec for name, spec in full_plan.layer_specs.items()
     }
+
     global_plan = compose_asymspec_global_cache_plan(
-        target_specs=target_specs, full_plan=full_plan, base_plan=base_plan
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
     )
 
-    diagnostic = diagnose_asymspec_native_grouping(
-        global_plan=global_plan, vllm_config=_make_config()
+    assert len(global_plan.cache_groups) == (
+        len(global_plan.group_indices_for_domain(AsymSpecCacheDomain.TARGET))
+        + len(global_plan.group_indices_for_domain(AsymSpecCacheDomain.FULL))
+        + len(global_plan.group_indices_for_domain(AsymSpecCacheDomain.BASE))
+    )
+    assert global_plan.group_domains == tuple(
+        sorted(
+            global_plan.group_domains,
+            key=lambda domain: {
+                AsymSpecCacheDomain.TARGET: 0,
+                AsymSpecCacheDomain.FULL: 1,
+                AsymSpecCacheDomain.BASE: 2,
+            }[domain],
+        )
     )
 
-    assert diagnostic.role_separated is False
-    assert any(
-        {"target", "full", "base"}.issubset(roles) for roles in diagnostic.group_roles
+    def domain_for_layer(name: str) -> AsymSpecCacheDomain:
+        binding = global_plan.registry.global_to_binding.get(name)
+        if binding is None:
+            return AsymSpecCacheDomain.TARGET
+        return (
+            AsymSpecCacheDomain.FULL
+            if binding.role is AsymSpecViewRole.FULL
+            else AsymSpecCacheDomain.BASE
+        )
+
+    seen_layers: set[str] = set()
+    for index, group in enumerate(global_plan.cache_groups):
+        assert {domain_for_layer(name) for name in group.layer_names} == {
+            global_plan.domain_for_group(index)
+        }
+        seen_layers.update(group.layer_names)
+    assert seen_layers == set(global_plan.merged_specs)
+    for name in seen_layers:
+        binding = global_plan.registry.global_to_binding.get(name)
+        if binding is not None:
+            assert (
+                global_plan.registry.global_name_for(
+                    binding.role, binding.physical_layer_name
+                )
+                == name
+            )
+    for domain, original_groups in (
+        (AsymSpecCacheDomain.FULL, full_plan.cache_groups),
+        (AsymSpecCacheDomain.BASE, base_plan.cache_groups),
+    ):
+        composed_groups = [
+            global_plan.cache_groups[index]
+            for index in global_plan.group_indices_for_domain(domain)
+        ]
+        assert [
+            [
+                global_plan.registry.binding_for(name).physical_layer_name
+                for name in group.layer_names
+            ]
+            for group in composed_groups
+        ] == [group.layer_names for group in original_groups]
+    assert all(
+        group.kv_cache_spec is original.kv_cache_spec
+        for group, original in zip(
+            global_plan.cache_groups[
+                len(global_plan.group_indices_for_domain(AsymSpecCacheDomain.TARGET)) :
+            ],
+            full_plan.cache_groups + base_plan.cache_groups,
+        )
     )
+
+    compatibility = characterize_asymspec_allocator_compatibility(
+        global_plan=global_plan,
+        vllm_config=config,
+        available_memory=1 << 30,
+    )
+    # The generic allocator either builds metadata or reports a precise pure
+    # compatibility error; it never receives a cache tensor or block pool here.
+    if compatibility.config_error is None:
+        assert compatibility.num_blocks is not None
+        assert compatibility.tensor_shares_domains is True
+    else:
+        assert compatibility.num_blocks is None

@@ -3,13 +3,18 @@
 """Allocation-free, role-aware KV cache plans for AsymSpec draft views."""
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+    get_uniform_page_size,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheGroupSpec,
@@ -34,6 +39,19 @@ class AsymSpecCachePlan:
     max_model_len: int
     layer_specs: dict[str, KVCacheSpec]
     cache_groups: list[KVCacheGroupSpec]
+
+
+class AsymSpecCacheDomain(str, Enum):
+    """Semantic owner of an engine-global cache group.
+
+    This deliberately differs from :class:`AsymSpecViewRole`: TARGET is not a
+    draft view, while FULL and BASE are. Cache allocation and scheduling can
+    therefore use this type without assigning meaning to a global group index.
+    """
+
+    TARGET = "target"
+    FULL = "full"
+    BASE = "base"
 
 
 @dataclass(frozen=True)
@@ -99,26 +117,47 @@ class AsymSpecGlobalCachePlan:
 
     merged_specs: dict[str, KVCacheSpec]
     registry: AsymSpecCacheNameRegistry
+    cache_groups: tuple[KVCacheGroupSpec, ...]
+    group_domains: tuple[AsymSpecCacheDomain, ...]
+
+    def domain_for_group(self, global_group_index: int) -> AsymSpecCacheDomain:
+        return self.group_domains[global_group_index]
+
+    def group_indices_for_domain(self, domain: AsymSpecCacheDomain) -> tuple[int, ...]:
+        return tuple(
+            index
+            for index, group_domain in enumerate(self.group_domains)
+            if group_domain is domain
+        )
 
 
 @dataclass(frozen=True)
-class AsymSpecNativeGroupingDiagnostic:
-    """Role composition observed from native, allocation-free grouping."""
+class AsymSpecAllocatorCompatibility:
+    """Allocation-free characterization of generic allocator behavior."""
 
-    group_roles: tuple[frozenset[str], ...]
-
-    @property
-    def role_separated(self) -> bool:
-        return all(len(roles) == 1 for roles in self.group_roles)
+    uniform_page_size_bytes: int | None
+    uniform_page_size_error: str | None
+    num_blocks: int | None
+    tensor_shared_domains: tuple[frozenset[AsymSpecCacheDomain], ...]
+    tensor_shares_domains: bool
+    config_error: str | None
 
 
 def compose_asymspec_global_cache_plan(
     *,
+    vllm_config: VllmConfig,
     target_specs: dict[str, KVCacheSpec],
     full_plan: AsymSpecCachePlan,
     base_plan: AsymSpecCachePlan,
 ) -> AsymSpecGlobalCachePlan:
-    """Compose target/FULL/BASE specs without mutating either role plan."""
+    """Compose role-separated groups without mutating either role plan.
+
+    Native grouping is run independently inside each cache domain. Draft-group
+    layer names are then translated to engine-global aliases, preventing a
+    shared physical Qwen layer from making FULL/BASE cache ownership ambiguous.
+    The resulting group order is deterministic (TARGET, FULL, BASE), but all
+    semantic ownership is carried by ``group_domains`` instead of that order.
+    """
     if full_plan.role is not AsymSpecViewRole.FULL:
         raise ValueError("AsymSpec FULL cache plan must have role FULL.")
     if base_plan.role is not AsymSpecViewRole.BASE:
@@ -132,32 +171,100 @@ def compose_asymspec_global_cache_plan(
         for physical_layer_name, spec in plan.layer_specs.items():
             global_name = registry.global_name_for(plan.role, physical_layer_name)
             merged_specs[global_name] = spec
-    return AsymSpecGlobalCachePlan(merged_specs, registry)
+
+    target_groups = get_kv_cache_groups(vllm_config, dict(target_specs))
+
+    def alias_groups(
+        plan: AsymSpecCachePlan,
+    ) -> list[KVCacheGroupSpec]:
+        return [
+            KVCacheGroupSpec(
+                layer_names=[
+                    registry.global_name_for(plan.role, layer_name)
+                    for layer_name in group.layer_names
+                ],
+                kv_cache_spec=group.kv_cache_spec,
+                is_eagle_group=group.is_eagle_group,
+            )
+            for group in plan.cache_groups
+        ]
+
+    full_groups = alias_groups(full_plan)
+    base_groups = alias_groups(base_plan)
+    cache_groups = tuple(target_groups + full_groups + base_groups)
+    group_domains = (
+        (AsymSpecCacheDomain.TARGET,) * len(target_groups)
+        + (AsymSpecCacheDomain.FULL,) * len(full_groups)
+        + (AsymSpecCacheDomain.BASE,) * len(base_groups)
+    )
+    return AsymSpecGlobalCachePlan(
+        merged_specs=merged_specs,
+        registry=registry,
+        cache_groups=cache_groups,
+        group_domains=group_domains,
+    )
 
 
-def diagnose_asymspec_native_grouping(
+def characterize_asymspec_allocator_compatibility(
     *,
     global_plan: AsymSpecGlobalCachePlan,
     vllm_config: VllmConfig,
-) -> AsymSpecNativeGroupingDiagnostic:
-    """Characterize whether native grouping preserves role boundaries.
+    available_memory: int,
+) -> AsymSpecAllocatorCompatibility:
+    """Exercise generic allocation *metadata* without allocating cache memory."""
+    try:
+        uniform_page_size = get_uniform_page_size(
+            group.kv_cache_spec for group in global_plan.cache_groups
+        )
+    except (AssertionError, NotImplementedError) as error:
+        uniform_page_size = None
+        page_sizes = sorted(
+            {group.kv_cache_spec.page_size_bytes for group in global_plan.cache_groups}
+        )
+        uniform_page_size_error = (
+            f"{type(error).__name__}: incompatible page sizes {page_sizes}"
+        )
+    else:
+        uniform_page_size_error = None
 
-    The native helper can normalize its input mapping, so this intentionally
-    passes a fresh mapping. The global plan and role-owned plans stay intact.
-    """
-    groups = get_kv_cache_groups(vllm_config, dict(global_plan.merged_specs))
-    group_roles: list[frozenset[str]] = []
-    for group in groups:
-        roles = {
-            (
-                global_plan.registry.binding_for(layer_name).role.value
-                if layer_name in global_plan.registry.global_to_binding
-                else "target"
-            )
-            for layer_name in group.layer_names
-        }
-        group_roles.append(frozenset(roles))
-    return AsymSpecNativeGroupingDiagnostic(tuple(group_roles))
+    try:
+        config = get_kv_cache_config_from_groups(
+            vllm_config, list(global_plan.cache_groups), available_memory
+        )
+    except (AssertionError, NotImplementedError, ValueError) as error:
+        return AsymSpecAllocatorCompatibility(
+            uniform_page_size_bytes=uniform_page_size,
+            uniform_page_size_error=uniform_page_size_error,
+            num_blocks=None,
+            tensor_shared_domains=(),
+            tensor_shares_domains=False,
+            config_error=f"{type(error).__name__}: {error}",
+        )
+
+    def domain_for_layer(layer_name: str) -> AsymSpecCacheDomain:
+        binding = global_plan.registry.global_to_binding.get(layer_name)
+        if binding is None:
+            return AsymSpecCacheDomain.TARGET
+        return (
+            AsymSpecCacheDomain.FULL
+            if binding.role is AsymSpecViewRole.FULL
+            else AsymSpecCacheDomain.BASE
+        )
+
+    tensor_shared_domains = tuple(
+        frozenset(domain_for_layer(layer_name) for layer_name in tensor.shared_by)
+        for tensor in config.kv_cache_tensors
+    )
+    return AsymSpecAllocatorCompatibility(
+        uniform_page_size_bytes=uniform_page_size,
+        uniform_page_size_error=uniform_page_size_error,
+        num_blocks=config.num_blocks,
+        tensor_shared_domains=tensor_shared_domains,
+        tensor_shares_domains=any(
+            len(domains) > 1 for domains in tensor_shared_domains
+        ),
+        config_error=None,
+    )
 
 
 def _layer_specs_from_model(
