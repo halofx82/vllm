@@ -906,6 +906,15 @@ class SpeculativeConfig:
                 draft_hf_overrides: HfOverrides
                 if self.method == "medusa":
                     draft_hf_overrides = {"model_type": "medusa"}
+                elif self.method == "asymspec":
+                    # Qwen3.5 checkpoints may include MTP metadata, but
+                    # AsymSpec uses the external draft checkpoint as a normal
+                    # language model. Do not apply the generic draft override
+                    # that rewrites Qwen3.5 into an MTP architecture.
+                    target_override = self.target_model_config.hf_overrides
+                    draft_hf_overrides = (
+                        target_override if callable(target_override) else {}
+                    )
                 else:
                     # Compose any callable hf_overrides set on the target so the
                     # draft config receives the same transform (e.g. the test
@@ -913,6 +922,10 @@ class SpeculativeConfig:
                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
                         self.target_model_config.hf_overrides
                     )
+                draft_language_model_only = self.method == "asymspec" and bool(
+                    self.target_model_config.multimodal_config is not None
+                    and self.target_model_config.multimodal_config.language_model_only
+                )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
@@ -937,6 +950,11 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
+                    # Public Qwen3.5 checkpoints are conditional-generation
+                    # models. AsymSpec operates on token IDs only, so the
+                    # separate draft ModelConfig must mirror a language-only
+                    # target and must not instantiate its vision tower.
+                    language_model_only=draft_language_model_only,
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
@@ -1535,7 +1553,7 @@ class SpeculativeConfig:
         return self.num_speculative_tokens_per_batch_size is not None
 
     def uses_draft_model(self) -> bool:
-        return self.method in ("draft_model", "asymspec")
+        return self.method == "draft_model"
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"

@@ -650,6 +650,8 @@ class GPUModelRunner(
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "asymspec":
+                self._initialize_asymspec_draft_views()
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -3419,6 +3421,9 @@ class GPUModelRunner(
         return self.model
 
     def get_draft_model(self) -> nn.Module | None:
+        asymspec_views = getattr(self, "asymspec_draft_views", None)
+        if asymspec_views is not None:
+            return asymspec_views.model
         drafter = getattr(self, "drafter", None)
         if drafter is None:
             return None
@@ -3428,6 +3433,16 @@ class GPUModelRunner(
         ):
             return cast(nn.Module, model.unwrap())
         return cast(nn.Module | None, model)
+
+    def _initialize_asymspec_draft_views(self) -> None:
+        """Set up AsymSpec's shared physical draft model holder.
+
+        Cache/state attachment and proposal generation intentionally belong to
+        later migration stages.
+        """
+        from vllm.v1.spec_decode.asymspec import AsymSpecDraftViews
+
+        self.asymspec_draft_views = AsymSpecDraftViews(self.vllm_config, self.device)
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
@@ -5439,6 +5454,8 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                if hasattr(self, "asymspec_draft_views"):
+                    self.asymspec_draft_views.load_model()
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):

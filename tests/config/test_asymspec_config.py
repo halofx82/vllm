@@ -32,6 +32,7 @@ class _FakeModelConfig:
         self.config_format = "auto"
         self.hf_config = SimpleNamespace(model_type="llama")
         self.architectures = ["LlamaForCausalLM"]
+        self.multimodal_config = None
 
     def get_vocab_size(self) -> int:
         return 32000
@@ -74,7 +75,9 @@ def test_asymspec_minimal_config_is_valid(asymspec_config_dependencies):
     )
 
     assert config.method == "asymspec"
-    assert config.uses_draft_model()
+    # AsymSpec uses its own view holder rather than the generic draft-model
+    # proposer; the model config is still constructed and validated here.
+    assert not config.uses_draft_model()
     assert config.asymspec_compressed_max_model_len == 8192
     assert config.asymspec_full_prefill_chunk_tokens == 8192
     assert config.asymspec_evidence_mode == "off"
@@ -125,3 +128,31 @@ def test_asymspec_rejects_invalid_full_prefill_chunk_size(
             asymspec_full_prefill_chunk_tokens=0,
             **asymspec_config_dependencies,
         )
+
+
+def test_asymspec_preserves_target_language_only_draft_configuration(monkeypatch):
+    target = _FakeModelConfig()
+    target.multimodal_config = SimpleNamespace(language_model_only=True)
+    target_override = lambda hf_config: hf_config
+    target.hf_overrides = target_override
+    draft = _FakeModelConfig()
+    captured: dict[str, object] = {}
+
+    def make_draft_config(**kwargs):
+        captured.update(kwargs)
+        return draft
+
+    monkeypatch.setattr(speculative_module, "ModelConfig", make_draft_config)
+    SpeculativeConfig(
+        method="asymspec",
+        model="Qwen/Qwen3.5-4B",
+        num_speculative_tokens=2,
+        asymspec_compressed_max_model_len=8192,
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    assert captured["language_model_only"] is True
+    # The generic draft architecture transform is deliberately bypassed for
+    # Qwen3.5. A user-supplied callable transform remains intact.
+    assert captured["hf_overrides"] is target_override
