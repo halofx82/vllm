@@ -14,6 +14,7 @@ import vllm.v1.spec_decode.asymspec.views as views_module
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -32,6 +33,8 @@ class _VllmConfig:
     parallel_config: _ParallelConfig
     model_config: object
     quant_config: object | None = None
+    cache_config: object | None = None
+    scheduler_config: object | None = None
 
 
 def _make_config(method: str = "asymspec") -> _VllmConfig:
@@ -41,8 +44,22 @@ def _make_config(method: str = "asymspec") -> _VllmConfig:
         draft_parallel_config=_ParallelConfig(),
         draft_load_config=None,
         num_speculative_tokens=2,
+        asymspec_compressed_max_model_len=128,
     )
-    return _VllmConfig(speculative_config, _ParallelConfig(), object())
+    cache_config = SimpleNamespace(
+        block_size=16,
+        mamba_block_size=256,
+        mamba_page_size_padded=None,
+        mamba_cache_mode="none",
+    )
+    scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+    return _VllmConfig(
+        speculative_config,
+        _ParallelConfig(),
+        SimpleNamespace(max_model_len=1024),
+        cache_config=cache_config,
+        scheduler_config=scheduler_config,
+    )
 
 
 def test_full_and_base_are_distinct_views_of_one_physical_model():
@@ -105,8 +122,12 @@ class _AttentionLayer(nn.Module, AttentionLayerBase):
         return object
 
     def get_kv_cache_spec(self, vllm_config):
-        del vllm_config
-        return None
+        return FullAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.bfloat16,
+        )
 
 
 class _GDNLayer(nn.Module, MambaBase):
@@ -174,3 +195,53 @@ def test_non_hybrid_draft_is_rejected_before_any_state_allocation():
     base = views.view(AsymSpecViewRole.BASE)
     assert full.state.hybrid_spec is None
     assert base.state.hybrid_spec is None
+
+
+def test_hybrid_cache_plans_are_role_owned_and_allocation_free():
+    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+    model = _HybridQwenLikeModel()
+    views.bind_model(model)
+    views.initialize_state_specs()
+
+    views.initialize_cache_plans()
+
+    full = views.view(AsymSpecViewRole.FULL)
+    base = views.view(AsymSpecViewRole.BASE)
+    full_plan = full.state.cache_plan
+    base_plan = base.state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    assert full_plan is not base_plan
+    assert full_plan.role is AsymSpecViewRole.FULL
+    assert base_plan.role is AsymSpecViewRole.BASE
+    assert full_plan.max_model_len == 1024
+    assert base_plan.max_model_len == 128
+    assert set(full_plan.layer_specs) == {
+        "layers.0.self_attn",
+        "layers.1.linear_attn",
+    }
+    assert set(base_plan.layer_specs) == set(full_plan.layer_specs)
+    assert isinstance(full_plan.layer_specs["layers.0.self_attn"], FullAttentionSpec)
+    assert isinstance(full_plan.layer_specs["layers.1.linear_attn"], MambaSpec)
+    assert len(full_plan.cache_groups) == len(base_plan.cache_groups) > 0
+    assert full_plan.cache_groups is not base_plan.cache_groups
+    assert all(
+        group is not other
+        for group, other in zip(full_plan.cache_groups, base_plan.cache_groups)
+    )
+    assert full.model is base.model is model
+    assert full.state.kv_state is base.state.kv_state is None
+    assert full.state.recurrent_state is base.state.recurrent_state is None
+    assert full.state.position_state is base.state.position_state is None
+    assert not hasattr(full_plan, "cache_group_id")
+
+
+def test_cache_plan_rejects_noncompact_mamba_metadata():
+    config = _make_config()
+    assert config.cache_config is not None
+    config.cache_config.mamba_cache_mode = "align"
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(_HybridQwenLikeModel())
+    views.initialize_state_specs()
+
+    with pytest.raises(ValueError, match="Mamba cache mode 'none'"):
+        views.initialize_cache_plans()

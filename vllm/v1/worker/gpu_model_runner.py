@@ -5457,6 +5457,7 @@ class GPUModelRunner(
                 if hasattr(self, "asymspec_draft_views"):
                     self.asymspec_draft_views.load_model()
                     self.asymspec_draft_views.initialize_state_specs()
+                    self.asymspec_draft_views.initialize_cache_plans()
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):

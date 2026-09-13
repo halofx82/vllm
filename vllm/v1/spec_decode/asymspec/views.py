@@ -9,6 +9,7 @@ one loaded draft model, with independent FULL and BASE runtime identities.
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,9 @@ from vllm.config import VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
 
 from .hybrid import AsymSpecHybridStateSpec, describe_qwen3_5_hybrid_state
+
+if TYPE_CHECKING:
+    from .cache_plan import AsymSpecCachePlan
 
 
 class AsymSpecViewRole(str, Enum):
@@ -40,6 +44,7 @@ class AsymSpecViewState:
     recurrent_state: object | None = None
     position_state: object | None = None
     hybrid_spec: AsymSpecHybridStateSpec | None = None
+    cache_plan: "AsymSpecCachePlan | None" = None
 
 
 @dataclass
@@ -122,6 +127,44 @@ class AsymSpecDraftViews:
             self.model, self.speculative_config.num_speculative_tokens
         )
         assert self.full.state.hybrid_spec is not self.base.state.hybrid_spec
+
+    def initialize_cache_plans(self) -> None:
+        """Attach allocation-free native KV-cache plans to both views."""
+        if self.model is None or self.full is None or self.base is None:
+            raise RuntimeError(
+                "AsymSpec draft views are unavailable before model load."
+            )
+        if self.full.state.hybrid_spec is None or self.base.state.hybrid_spec is None:
+            raise RuntimeError(
+                "AsymSpec hybrid state specs must be initialized before cache plans."
+            )
+
+        # Local import avoids a circular dependency: cache plans use the role
+        # enum defined in this module.
+        from .cache_plan import build_asymspec_cache_plan
+
+        compressed_max_model_len = (
+            self.speculative_config.asymspec_compressed_max_model_len
+        )
+        if compressed_max_model_len is None:
+            raise ValueError("AsymSpec requires a compressed max model length.")
+
+        draft_vllm_config = self._create_draft_vllm_config()
+        self.full.state.cache_plan = build_asymspec_cache_plan(
+            role=AsymSpecViewRole.FULL,
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            model=self.model,
+            hybrid_spec=self.full.state.hybrid_spec,
+            draft_vllm_config=draft_vllm_config,
+        )
+        self.base.state.cache_plan = build_asymspec_cache_plan(
+            role=AsymSpecViewRole.BASE,
+            max_model_len=compressed_max_model_len,
+            model=self.model,
+            hybrid_spec=self.base.state.hybrid_spec,
+            draft_vllm_config=draft_vllm_config,
+        )
+        assert self.full.state.cache_plan is not self.base.state.cache_plan
 
     def view(self, role: AsymSpecViewRole) -> AsymSpecView:
         """Return a logical view by semantic role, never by cache-group ID."""
