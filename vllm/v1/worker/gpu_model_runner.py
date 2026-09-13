@@ -7941,7 +7941,22 @@ class GPUModelRunner(
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+        # The static forward context intentionally includes the target model
+        # and AsymSpec's one physical draft model.  FULL and BASE derive their
+        # role-owned specs from the draft tree independently, so draft modules
+        # must not also be collected as TARGET specs.  Use module ownership,
+        # rather than registered names or cache-group IDs: model registration
+        # remains untouched and ordinary vLLM methods take this exact path
+        # without filtering.
+        asymspec_views = getattr(self, "asymspec_draft_views", None)
+        is_asymspec = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "asymspec"
+            and asymspec_views is not None
+        )
         for layer_name, attn_module in attn_layers.items():
+            if is_asymspec and asymspec_views.owns_physical_module(attn_module):
+                continue
             if isinstance(attn_module, Attention) and (
                 kv_tgt_layer := attn_module.kv_sharing_target_layer_name
             ):

@@ -112,6 +112,18 @@ class AsymSpecDraftViews:
         assert self.full is not self.base
         assert self.full.model is self.base.model is self.model
 
+    def owns_physical_module(self, module: nn.Module) -> bool:
+        """Return whether ``module`` belongs to the one physical draft tree.
+
+        The compilation static-forward context intentionally retains both the
+        target and draft modules.  AsymSpec uses this identity boundary when
+        collecting TARGET cache specs: draft modules belong exclusively to the
+        logical FULL and BASE cache plans, never to TARGET.
+        """
+        if self.model is None:
+            raise RuntimeError("AsymSpec draft model is unavailable before model load.")
+        return any(candidate is module for candidate in self.model.modules())
+
     def initialize_state_specs(self) -> None:
         """Attach independent, allocation-free hybrid state descriptions."""
         if self.model is None or self.full is None or self.base is None:

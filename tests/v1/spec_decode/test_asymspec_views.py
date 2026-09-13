@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 import vllm.v1.spec_decode.asymspec.views as views_module
+import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -132,9 +133,19 @@ def test_model_runner_selects_native_asymspec_view_holder():
     assert isinstance(runner.asymspec_draft_views, AsymSpecDraftViews)
 
 
+class _TestAttentionBackend:
+    @staticmethod
+    def indexes_kv_by_block_stride():
+        return False
+
+    @staticmethod
+    def customize_spec(spec):
+        return spec
+
+
 class _AttentionLayer(nn.Module, AttentionLayerBase):
     def get_attn_backend(self):
-        return object
+        return _TestAttentionBackend
 
     def get_kv_cache_spec(self, vllm_config):
         return FullAttentionSpec(
@@ -168,6 +179,118 @@ class _HybridQwenLikeModel(nn.Module):
             else:
                 layer.linear_attn = _GDNLayer()
             self.layers.append(layer)
+
+
+class _ManyLayerHybridModel(nn.Module):
+    """Small structural stand-in for the real 8-attention/24-GDN draft."""
+
+    def __init__(self, attention_layers: int, recurrent_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        total_layers = attention_layers + recurrent_layers
+        attention_indices = set(range(attention_layers))
+        for layer_index in range(total_layers):
+            layer = nn.Module()
+            if layer_index in attention_indices:
+                layer.self_attn = _AttentionLayer()
+            else:
+                layer.linear_attn = _GDNLayer()
+            self.layers.append(layer)
+
+
+def _make_kv_spec_runner(config, views):
+    return SimpleNamespace(
+        vllm_config=config,
+        speculative_config=config.speculative_config,
+        asymspec_draft_views=views,
+        shared_kv_cache_layers={},
+        kv_cache_dtype=torch.bfloat16,
+    )
+
+
+def test_asymspec_target_cache_specs_exclude_draft_by_module_ownership(monkeypatch):
+    """TARGET sees only target modules; FULL/BASE own the shared draft tree."""
+    config = _make_config()
+    draft_model = _ManyLayerHybridModel(attention_layers=8, recurrent_layers=24)
+    target_model = _ManyLayerHybridModel(attention_layers=16, recurrent_layers=48)
+    views = AsymSpecDraftViews(config, torch.device("cpu"))
+    views.bind_model(draft_model)
+    runner = _make_kv_spec_runner(config, views)
+
+    static_layers = {
+        **{
+            f"target.{name}": module
+            for name, module in target_model.named_modules()
+            if isinstance(module, AttentionLayerBase)
+        },
+        **{
+            f"draft.{name}": module
+            for name, module in draft_model.named_modules()
+            if isinstance(module, AttentionLayerBase)
+        },
+    }
+    assert len(static_layers) == 96
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_layers_from_vllm_config",
+        lambda *_: static_layers,
+    )
+
+    target_specs = GPUModelRunner.get_kv_cache_spec(runner)
+
+    assert len(target_specs) == 64
+    assert all(name.startswith("target.") for name in target_specs)
+    assert sum(isinstance(spec, FullAttentionSpec) for spec in target_specs.values()) == 16
+    assert sum(isinstance(spec, MambaSpec) for spec in target_specs.values()) == 48
+    assert all(
+        not views.owns_physical_module(module)
+        for name, module in static_layers.items()
+        if name in target_specs
+    )
+
+    # The physical target is represented once, while the same physical draft
+    # tree is represented once per logical role: 64 + 32 + 32 = 128.
+    views.initialize_state_specs()
+    views.initialize_cache_plans()
+    full_plan = views.view(AsymSpecViewRole.FULL).state.cache_plan
+    base_plan = views.view(AsymSpecViewRole.BASE).state.cache_plan
+    assert full_plan is not None and base_plan is not None
+    global_plan = compose_asymspec_global_cache_plan(
+        vllm_config=config,
+        target_specs=target_specs,
+        full_plan=full_plan,
+        base_plan=base_plan,
+    )
+    assert len(full_plan.layer_specs) == 32
+    assert len(base_plan.layer_specs) == 32
+    assert len(global_plan.merged_specs) == 128
+
+
+def test_non_asymspec_target_cache_spec_collection_is_unfiltered(monkeypatch):
+    """Ordinary methods retain the exact static-context collection behavior."""
+    config = _make_config(method="draft_model")
+    target_layer = _AttentionLayer()
+    draft_layer = _AttentionLayer()
+    static_layers = {"target.attn": target_layer, "draft.attn": draft_layer}
+    runner = SimpleNamespace(
+        vllm_config=config,
+        speculative_config=config.speculative_config,
+        # Deliberately present: this must not affect a non-AsymSpec method.
+        asymspec_draft_views=SimpleNamespace(
+            owns_physical_module=lambda _: (_ for _ in ()).throw(AssertionError())
+        ),
+        shared_kv_cache_layers={},
+        kv_cache_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_layers_from_vllm_config",
+        lambda *_: static_layers,
+    )
+
+    specs = GPUModelRunner.get_kv_cache_spec(runner)
+
+    assert set(specs) == set(static_layers)
 
 
 def test_hybrid_specs_are_role_owned_and_allocation_free():
