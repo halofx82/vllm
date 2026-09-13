@@ -17,6 +17,8 @@ from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
 
+from .hybrid import AsymSpecHybridStateSpec, describe_qwen3_5_hybrid_state
+
 
 class AsymSpecViewRole(str, Enum):
     """Semantic identity of an AsymSpec logical draft view."""
@@ -37,6 +39,7 @@ class AsymSpecViewState:
     kv_state: object | None = None
     recurrent_state: object | None = None
     position_state: object | None = None
+    hybrid_spec: AsymSpecHybridStateSpec | None = None
 
 
 @dataclass
@@ -102,6 +105,23 @@ class AsymSpecDraftViews:
         self.base = AsymSpecView(AsymSpecViewRole.BASE, model)
         assert self.full is not self.base
         assert self.full.model is self.base.model is self.model
+
+    def initialize_state_specs(self) -> None:
+        """Attach independent, allocation-free hybrid state descriptions."""
+        if self.model is None or self.full is None or self.base is None:
+            raise RuntimeError(
+                "AsymSpec draft views are unavailable before model load."
+            )
+
+        # Build separate descriptor objects: the physical layers remain shared,
+        # while each logical role owns its future KV/GDN/position state.
+        self.full.state.hybrid_spec = describe_qwen3_5_hybrid_state(
+            self.model, self.speculative_config.num_speculative_tokens
+        )
+        self.base.state.hybrid_spec = describe_qwen3_5_hybrid_state(
+            self.model, self.speculative_config.num_speculative_tokens
+        )
+        assert self.full.state.hybrid_spec is not self.base.state.hybrid_spec
 
     def view(self, role: AsymSpecViewRole) -> AsymSpecView:
         """Return a logical view by semantic role, never by cache-group ID."""

@@ -2,6 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native AsymSpec components."""
 
+from .hybrid import AsymSpecHybridStateSpec
 from .views import AsymSpecDraftViews, AsymSpecView, AsymSpecViewRole
 
-__all__ = ["AsymSpecDraftViews", "AsymSpecView", "AsymSpecViewRole"]
+__all__ = [
+    "AsymSpecDraftViews",
+    "AsymSpecHybridStateSpec",
+    "AsymSpecView",
+    "AsymSpecViewRole",
+]

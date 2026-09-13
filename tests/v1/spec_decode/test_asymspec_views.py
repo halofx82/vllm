@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 
 import vllm.v1.spec_decode.asymspec.views as views_module
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -37,6 +40,7 @@ def _make_config(method: str = "asymspec") -> _VllmConfig:
         draft_model_config=SimpleNamespace(model="test-draft"),
         draft_parallel_config=_ParallelConfig(),
         draft_load_config=None,
+        num_speculative_tokens=2,
     )
     return _VllmConfig(speculative_config, _ParallelConfig(), object())
 
@@ -94,3 +98,79 @@ def test_model_runner_selects_native_asymspec_view_holder():
     GPUModelRunner._initialize_asymspec_draft_views(runner)
 
     assert isinstance(runner.asymspec_draft_views, AsymSpecDraftViews)
+
+
+class _AttentionLayer(nn.Module, AttentionLayerBase):
+    def get_attn_backend(self):
+        return object
+
+    def get_kv_cache_spec(self, vllm_config):
+        del vllm_config
+        return None
+
+
+class _GDNLayer(nn.Module, MambaBase):
+    def get_state_shape(self):
+        return ((4, 8), (2, 3, 5))
+
+    def get_state_dtype(self):
+        return (torch.bfloat16, torch.float32)
+
+    @property
+    def mamba_type(self):
+        return MambaAttentionBackendEnum.GDN_ATTN
+
+
+class _HybridQwenLikeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for layer_index in range(2):
+            layer = nn.Module()
+            if layer_index == 0:
+                layer.self_attn = _AttentionLayer()
+            else:
+                layer.linear_attn = _GDNLayer()
+            self.layers.append(layer)
+
+
+def test_hybrid_specs_are_role_owned_and_allocation_free():
+    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+    model = _HybridQwenLikeModel()
+    views.bind_model(model)
+
+    views.initialize_state_specs()
+
+    full = views.view(AsymSpecViewRole.FULL)
+    base = views.view(AsymSpecViewRole.BASE)
+    full_spec = full.state.hybrid_spec
+    base_spec = base.state.hybrid_spec
+    assert full_spec is not None and base_spec is not None
+    assert full_spec is not base_spec
+    assert full_spec.recurrent is not base_spec.recurrent
+    assert full_spec.attention[0].layer_name == "layers.0.self_attn"
+    assert full_spec.recurrent[0].layer_name == "layers.1.linear_attn"
+    assert full_spec.recurrent[0].shapes == ((4, 8), (2, 3, 5))
+    assert full_spec.recurrent[0].dtypes == (torch.bfloat16, torch.float32)
+    assert full_spec.compact_recurrent_state_slots == 3
+    assert full.model is base.model is model
+    assert full.state.kv_state is base.state.kv_state is None
+    assert full.state.recurrent_state is base.state.recurrent_state is None
+    assert full.state.position_state is base.state.position_state is None
+    assert not hasattr(full_spec, "cache_group_id")
+
+
+def test_non_hybrid_draft_is_rejected_before_any_state_allocation():
+    views = AsymSpecDraftViews(_make_config(), torch.device("cpu"))
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].self_attn = _AttentionLayer()
+    views.bind_model(model)
+
+    with pytest.raises(ValueError, match="hybrid Qwen3.5"):
+        views.initialize_state_specs()
+
+    full = views.view(AsymSpecViewRole.FULL)
+    base = views.view(AsymSpecViewRole.BASE)
+    assert full.state.hybrid_spec is None
+    assert base.state.hybrid_spec is None
