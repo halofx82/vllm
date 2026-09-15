@@ -8,17 +8,22 @@ from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.spec_decode.asymspec.live_iteration import _live_prompt_ids
 from vllm.v1.spec_decode.asymspec.target_diagnostic import (
+    build_asymspec_fixed_acceptance_outcome,
     capture_asymspec_verifier_rows,
 )
 from vllm.v1.spec_decode.asymspec.verifier_bridge import (
     DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
+    DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT,
+    DIAGNOSTIC_FIXED_ACCEPTED_COUNT,
     DIAGNOSTIC_LIVE_BASE_LAG_TOKENS,
     DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_OUTPUT_PATH,
     DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS,
+    DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS,
     DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
     arm_asymspec_live_spec_tokens,
+    arm_asymspec_diagnostic_control_spec_tokens,
     register_asymspec_diagnostic_spec_tokens,
 )
 
@@ -93,6 +98,21 @@ def test_live_bridge_rejects_a_computed_or_missing_seed():
         arm_asymspec_live_spec_tokens(
             request, SimpleNamespace(method="asymspec"), (13, 17)
         )
+
+
+def test_target_control_arms_only_after_ordinary_seed_and_decode():
+    request = _request(
+        extra_args={
+            DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT: 2,
+            DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS: [13, 17],
+        }
+    )
+    request.num_output_tokens = 1
+    config = SimpleNamespace(method="asymspec")
+    assert not arm_asymspec_diagnostic_control_spec_tokens(request, config)
+    request.num_output_tokens = 2
+    assert arm_asymspec_diagnostic_control_spec_tokens(request, config)
+    assert request.spec_token_ids == [13, 17]
 
 
 def test_live_preseed_commits_are_the_only_deferred_base_range():
@@ -192,6 +212,116 @@ def test_live_capture_marker_does_not_finish_non_asymspec_request():
     )
 
     assert req_id in scheduler.requests
+
+
+@pytest.mark.parametrize(
+    ("accepted_count", "expected_tokens"),
+    [(0, [31]), (1, [13, 41]), (2, [13, 17, 59])],
+)
+def test_fixed_acceptance_uses_the_matching_native_verifier_row(
+    accepted_count, expected_tokens
+):
+    request_id = "fixed"
+    requests = {
+        request_id: SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                extra_args={DIAGNOSTIC_FIXED_ACCEPTED_COUNT: accepted_count}
+            )
+        )
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={request_id: [13, 17]}
+    )
+    metadata = SimpleNamespace(
+        num_draft_tokens=[2],
+        max_spec_len=2,
+        target_logits_indices=torch.tensor([0, 1]),
+        bonus_logits_indices=torch.tensor([2]),
+    )
+    logits = torch.zeros(3, 64)
+    logits[0, 31] = 1
+    logits[1, 41] = 1
+    logits[2, 59] = 1
+
+    outcome = build_asymspec_fixed_acceptance_outcome(
+        scheduler_output=scheduler_output,
+        spec_decode_metadata=metadata,
+        logits=logits,
+        requests=requests,
+        is_asymspec=True,
+    )
+
+    assert outcome is not None
+    assert outcome.accepted_count == accepted_count
+    assert outcome.next_seed_token_id == expected_tokens[-1]
+    assert outcome.output_token_ids.tolist() == [
+        expected_tokens + [-1] * (3 - len(expected_tokens))
+    ]
+
+
+@pytest.mark.parametrize("accepted_count", [0, 1, 2])
+def test_scheduler_applies_fixed_native_spec_outcome(accepted_count):
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    assert scheduler.vllm_config.speculative_config is not None
+    scheduler.vllm_config.speculative_config.method = "asymspec"
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    # Model the native seed boundary: S is canonical but remains uncomputed.
+    seed = 29
+    request.append_output_token_ids(seed)
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.spec_token_ids = [13, 17]
+    scheduled = scheduler.schedule()
+    req_id = request.request_id
+    assert scheduled.scheduled_spec_decode_tokens[req_id] == [13, 17]
+    assert request.num_computed_tokens == request.num_prompt_tokens + 3
+
+    next_seed = 41 + accepted_count
+    generated = [13, 17][:accepted_count] + [next_seed]
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[generated],
+        ),
+    )
+
+    assert list(request.output_token_ids) == [seed, *generated]
+    assert request.num_computed_tokens == request.num_prompt_tokens + 1 + accepted_count
+    assert request.num_tokens == request.num_computed_tokens + 1
+
+
+def test_fixed_outcome_can_arm_one_follow_up_seed_verification():
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    assert scheduler.vllm_config.speculative_config is not None
+    scheduler.vllm_config.speculative_config.method = "asymspec"
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    assert request.sampling_params is not None
+    request.sampling_params.extra_args = {
+        DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS: [43, 47],
+    }
+    scheduler.add_request(request)
+    scheduler.schedule()
+    request.append_output_token_ids(29)
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.spec_token_ids = [13, 17]
+    scheduled = scheduler.schedule()
+    req_id = request.request_id
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[13, 41]],
+            asymspec_fixed_acceptance_counts={req_id: 1},
+        ),
+    )
+
+    assert list(request.output_token_ids) == [29, 13, 41]
+    assert request.num_computed_tokens == request.num_tokens - 1
+    assert request.spec_token_ids == [43, 47]
 
 
 @pytest.mark.parametrize("tokens", [[13], [13, 17, 19], [13, -1]])

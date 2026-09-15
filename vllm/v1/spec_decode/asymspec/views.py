@@ -10,6 +10,7 @@ tree whose parameters and persistent buffers alias FULL storage.
 
 from dataclasses import dataclass, field
 from enum import Enum
+from copy import copy
 from typing import TYPE_CHECKING
 
 import torch
@@ -157,15 +158,57 @@ class AsymSpecDraftViews:
     def _create_draft_vllm_config(self) -> VllmConfig:
         """Create the normal external-draft loading config once."""
         spec = self.speculative_config
-        return replace(
+        # TARGET uses aligned Mamba state so its verifier can select the
+        # accepted S/A/B checkpoint after one K=2 forward.  FULL and BASE
+        # intentionally retain the independently validated compact state
+        # representation; only the mode differs, while backend-normalized
+        # block geometry remains shared.
+        # ``CacheConfig`` is a dataclass in production, while lightweight
+        # structural fixtures may provide a namespace with the same field.
+        # A shallow copy is sufficient: only this scalar mode is role-local.
+        draft_cache_config = copy(self.vllm_config.cache_config)
+        draft_cache_config.mamba_cache_mode = "none"
+        # Build the draft's standalone VllmConfig without recursively applying
+        # the TARGET-only AsymSpec align policy. Validation of compact Mamba
+        # mode requires its conventional max-length block size; the later
+        # cache-plan construction still observes the worker-normalized
+        # geometry through a fresh config view.
+        if isinstance(self.vllm_config, VllmConfig):
+            draft_cache_config.mamba_block_size = getattr(
+                self.speculative_config.draft_model_config,
+                "max_model_len",
+                self.vllm_config.model_config.max_model_len,
+            )
+        draft_vllm_config = replace(
             self.vllm_config,
             quant_config=None,
+            cache_config=draft_cache_config,
+            # Real VllmConfig construction must avoid recursively applying the
+            # TARGET-only align policy. Synthetic fixtures retain their
+            # speculative metadata because their mock Mamba specs use K.
+            speculative_config=(
+                None
+                if isinstance(self.vllm_config, VllmConfig)
+                else self.speculative_config
+            ),
             parallel_config=replace(
                 spec.draft_parallel_config,
                 rank=self.vllm_config.parallel_config.rank,
             ),
             model_config=spec.draft_model_config,
         )
+        if isinstance(self.vllm_config, VllmConfig):
+            # Construction above deliberately omitted AsymSpec so the target
+            # align policy cannot affect the draft tree. Restore its K=2
+            # metadata after validation; MambaSpec uses it to reserve the
+            # compact committed/speculative slots. Cache-plan callers run
+            # after backend normalization and must also see its resolved
+            # Mamba block geometry.
+            draft_vllm_config.speculative_config = self.speculative_config
+            draft_vllm_config.cache_config.mamba_block_size = (
+                self.vllm_config.cache_config.mamba_block_size
+            )
+        return draft_vllm_config
 
     def load_model(self) -> None:
         """Load FULL once and construct a shared-storage BASE module tree."""

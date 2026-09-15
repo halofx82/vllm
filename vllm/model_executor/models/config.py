@@ -599,6 +599,26 @@ class MambaModelConfig(VerifyAndUpdateConfig):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
 
+        # AsymSpec's verifier is the one deliberately narrow exception to
+        # vLLM's usual "no prefix cache => compact Mamba state" policy.  Its
+        # target verifier consumes an uncomputed seed plus K=2 candidates in
+        # one forward and must retain the state after each token until the
+        # externally selected outcome is known.  The native align lifecycle
+        # provides that checkpoint selection.  Draft views are loaded through
+        # their own compact cache configuration (see AsymSpecDraftViews), so
+        # this affects TARGET only.  Ordinary vLLM configurations never enter
+        # this branch.
+        speculative_config = vllm_config.speculative_config
+        is_asymspec_target = (
+            speculative_config is not None
+            and speculative_config.method == "asymspec"
+        )
+        if is_asymspec_target:
+            cache_config.mamba_cache_mode = "align"
+            if cache_config.mamba_block_size is None:
+                cache_config.mamba_block_size = cache_config.block_size
+            return
+
         if cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode == "none":
                 cache_config.mamba_cache_mode = "align"

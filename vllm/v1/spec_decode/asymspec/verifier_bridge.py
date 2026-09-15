@@ -19,6 +19,65 @@ DIAGNOSTIC_LIVE_BASE_LAG_TOKENS = "asymspec_live_base_lag_tokens"
 DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS = (
     "asymspec_live_preseed_committed_token_ids"
 )
+# Test-only: selects the already-produced verifier row that supplies the
+# canonical-but-uncomputed token for the next V1 iteration.  This is not an
+# AsymSpec acceptance policy; callers explicitly provide 0, 1, or 2.
+DIAGNOSTIC_FIXED_ACCEPTED_COUNT = "asymspec_diagnostic_fixed_accepted_count"
+DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS = "asymspec_diagnostic_next_spec_token_ids"
+DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH = "asymspec_diagnostic_target_control_output_path"
+DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT = "asymspec_diagnostic_arm_after_output_count"
+
+
+def arm_asymspec_diagnostic_next_spec_tokens(
+    request: Request, speculative_config: SpeculativeConfig | None
+) -> bool:
+    """Arm one test-only follow-up K=2 pair after a fixed V1 outcome.
+
+    The next scheduler pass consumes the ordinary V1 output token (R) and
+    this pair as ``[R, C, D]``.  This is only a state-parity diagnostic.
+    """
+    if speculative_config is None or speculative_config.method != "asymspec":
+        return False
+    params = request.sampling_params
+    extra_args = None if params is None else params.extra_args
+    if not extra_args or DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS not in extra_args:
+        return False
+    tokens = extra_args[DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS]
+    if (not isinstance(tokens, (list, tuple)) or len(tokens) != 2
+            or not all(isinstance(token, int) and token >= 0 for token in tokens)):
+        raise ValueError("AsymSpec next diagnostic pair requires two non-negative IDs.")
+    if request.spec_token_ids:
+        raise RuntimeError(
+            "AsymSpec next diagnostic pair cannot overwrite spec tokens."
+        )
+    request.spec_token_ids = [int(token) for token in tokens]
+    return True
+
+
+def arm_asymspec_diagnostic_control_spec_tokens(
+    request: Request, speculative_config: SpeculativeConfig | None
+) -> bool:
+    """Arm a target-control pair after ordinary V1 has produced its seed.
+
+    This is solely the independent canonical control for the fixed-outcome
+    state diagnostic: prefix prefill produces S, ordinary decode of S
+    produces R, and the following verifier sees ``[R, C, D]``.  It never
+    participates in regular AsymSpec or ordinary V1 requests.
+    """
+    if speculative_config is None or speculative_config.method != "asymspec":
+        return False
+    params = request.sampling_params
+    extra_args = None if params is None else params.extra_args
+    if not extra_args or DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT not in extra_args:
+        return False
+    if request.spec_token_ids:
+        return False
+    after = extra_args[DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT]
+    if not isinstance(after, int) or after < 1:
+        raise ValueError("AsymSpec target control needs a positive output count.")
+    if request.num_output_tokens != after:
+        return False
+    return arm_asymspec_diagnostic_next_spec_tokens(request, speculative_config)
 
 
 def register_asymspec_diagnostic_spec_tokens(
@@ -48,6 +107,8 @@ def register_asymspec_diagnostic_spec_tokens(
             raise ValueError("AsymSpec live diagnostic is missing required metadata.")
         return True
     if DIAGNOSTIC_CANDIDATE_TOKEN_IDS not in extra_args:
+        if DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT in extra_args:
+            return True
         return False
     if request.spec_token_ids or hasattr(
         request, "_asymspec_diagnostic_pending_spec_token_ids"
@@ -62,7 +123,8 @@ def register_asymspec_diagnostic_spec_tokens(
         raise ValueError(
             "AsymSpec diagnostic verifier token IDs must be non-negative ints."
         )
-    if DIAGNOSTIC_VERIFIER_OUTPUT_PATH not in extra_args:
+    if (DIAGNOSTIC_VERIFIER_OUTPUT_PATH not in extra_args
+            and DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH not in extra_args):
         raise ValueError("AsymSpec diagnostic verifier requires an output path.")
     request._asymspec_diagnostic_pending_spec_token_ids = [
         int(token) for token in tokens

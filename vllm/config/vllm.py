@@ -2548,7 +2548,16 @@ class VllmConfig:
             self.cache_config.mamba_block_size is not None
             and self.cache_config.mamba_block_size != self.model_config.max_model_len
         )
-        if mamba_block_size_is_set and not self.cache_config.enable_prefix_caching:
+        is_asymspec_target_align = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "asymspec"
+            and self.cache_config.mamba_cache_mode == "align"
+        )
+        if (
+            mamba_block_size_is_set
+            and not self.cache_config.enable_prefix_caching
+            and not is_asymspec_target_align
+        ):
             raise ValueError(
                 "--mamba-block-size can only be set with --enable-prefix-caching"
             )

@@ -331,6 +331,9 @@ class ModelRunnerOutput:
     # ordinary speculative rejection sampler or acceptance bookkeeping.
     # Empty for every normal vLLM request, including normal speculation.
     asymspec_live_capture_complete: set[str] = field(default_factory=set)
+    # Explicit test-only fixed verifier outcomes. Normal V1 requests never
+    # populate this field.
+    asymspec_fixed_acceptance_counts: dict[str, int] = field(default_factory=dict)
 
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]

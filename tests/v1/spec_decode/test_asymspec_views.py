@@ -60,6 +60,9 @@ from vllm.v1.spec_decode.asymspec.proposer import AsymSpecFullK2Proposer
 from vllm.v1.spec_decode.asymspec.request_state import (
     create_asymspec_request_state,
 )
+from vllm.v1.spec_decode.asymspec.target_mamba_align import (
+    select_target_mamba_group_ids,
+)
 from vllm.v1.spec_decode.asymspec.views import (
     AsymSpecDraftViews,
     AsymSpecViewRole,
@@ -1212,7 +1215,7 @@ def test_model_runner_finalizes_only_existing_asymspec_views():
     GPUModelRunner.initialize_asymspec_cache_plans(ordinary_runner)
 
 
-def test_cache_plan_rejects_noncompact_mamba_metadata():
+def test_draft_cache_plans_remain_compact_when_target_uses_align():
     config = _make_config()
     assert config.cache_config is not None
     config.cache_config.mamba_cache_mode = "align"
@@ -1220,8 +1223,53 @@ def test_cache_plan_rejects_noncompact_mamba_metadata():
     views.bind_model(_HybridQwenLikeModel())
     views.initialize_state_specs()
 
-    with pytest.raises(ValueError, match="Mamba cache mode 'none'"):
-        views.initialize_cache_plans()
+    views.initialize_cache_plans()
+    for plan in (
+        views.view(AsymSpecViewRole.FULL).state.cache_plan,
+        views.view(AsymSpecViewRole.BASE).state.cache_plan,
+    ):
+        assert plan is not None
+        assert all(
+            not isinstance(spec, MambaSpec) or spec.mamba_cache_mode == "none"
+            for spec in plan.layer_specs.values()
+        )
+
+
+def test_target_align_group_selection_is_identity_based_and_excludes_drafts():
+    target_a = object()
+    target_b = object()
+    draft = object()
+    mamba_spec = MambaSpec(
+        block_size=800,
+        shapes=((4, 8), (2, 3, 5)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+        num_speculative_blocks=2,
+    )
+    attention_spec = FullAttentionSpec(
+        block_size=800,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    cache_config = SimpleNamespace(kv_cache_groups=[
+        SimpleNamespace(layer_names=("target.gdn_a",), kv_cache_spec=mamba_spec),
+        SimpleNamespace(layer_names=("target.attn",), kv_cache_spec=attention_spec),
+        SimpleNamespace(layer_names=("draft.gdn",), kv_cache_spec=mamba_spec),
+        SimpleNamespace(layer_names=("target.gdn_b",), kv_cache_spec=mamba_spec),
+    ])
+    selected = select_target_mamba_group_ids(
+        cache_config,
+        {
+            "target.gdn_a": target_a,
+            "target.attn": object(),
+            "draft.gdn": draft,
+            "target.gdn_b": target_b,
+        },
+        lambda module: module is draft,
+    )
+    assert selected == [0, 3]
 
 
 def test_global_cache_namespace_is_reversible_and_role_aware():

@@ -1110,17 +1110,54 @@ class GPUModelRunner(
         # decode + hybrid model.
         assert self.cache_config.mamba_cache_mode == "align"
         if self._mamba_bufs is None:
-            self._mamba_bufs = mamba_utils.MambaBuffers.create(
-                max_num_reqs=self.max_num_reqs,
-                kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_func(),
-                make_buffer=self._make_buffer,
-                device=self.device,
-                with_postprocess_align=(
-                    self.speculative_config is not None and self.model_config.is_hybrid
-                ),
-            )
+            if self._uses_asymspec_target_mamba_align():
+                from vllm.v1.spec_decode.asymspec.target_mamba_align import (
+                    create_for_target_groups,
+                    select_target_mamba_group_ids,
+                )
+
+                views = self.asymspec_draft_views
+                target_mamba_group_ids = select_target_mamba_group_ids(
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
+                    views.owns_physical_module,
+                )
+                self._mamba_bufs = create_for_target_groups(
+                    max_num_reqs=self.max_num_reqs,
+                    kv_cache_config=self.kv_cache_config,
+                    copy_funcs=self.model.get_mamba_state_copy_func(),
+                    make_buffer=self._make_buffer,
+                    device=self.device,
+                    mamba_group_ids=target_mamba_group_ids,
+                )
+            else:
+                self._mamba_bufs = mamba_utils.MambaBuffers.create(
+                    max_num_reqs=self.max_num_reqs,
+                    kv_cache_config=self.kv_cache_config,
+                    copy_funcs=self.model.get_mamba_state_copy_func(),
+                    make_buffer=self._make_buffer,
+                    device=self.device,
+                    with_postprocess_align=(
+                        self.speculative_config is not None
+                        and self.model_config.is_hybrid
+                    ),
+                )
         return self._mamba_bufs
+
+    def _uses_asymspec_target_mamba_align(self) -> bool:
+        """Whether this runner owns TARGET-only AsymSpec align state.
+
+        The generic target cache namespace excludes the separate FULL/BASE
+        trees. Keep that fact explicit here so their compact state cannot
+        accidentally enter the target's native fused Mamba lifecycle.
+        """
+        return bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "asymspec"
+            and self.model_config.is_hybrid
+            and self.cache_config.mamba_cache_mode == "align"
+            and hasattr(self, "asymspec_draft_views")
+        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -4490,18 +4527,37 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
-                mamba_utils.preprocess_mamba(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.cache_config,
-                    self.mamba_state_idx,
-                    self.input_batch,
-                    self.requests,
-                    self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
-                    mamba_bufs.preprocess,
-                    align_ctx=mamba_bufs.postprocess_align,
-                )
+                if self._uses_asymspec_target_mamba_align():
+                    from vllm.v1.spec_decode.asymspec.target_mamba_align import (
+                        preprocess_target_verifier,
+                    )
+
+                    assert mamba_bufs.postprocess_align is not None
+                    preprocess_target_verifier(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                        mamba_bufs.postprocess_align,
+                    )
+                else:
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                        align_ctx=mamba_bufs.postprocess_align,
+                    )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the
@@ -4743,11 +4799,18 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        sampler_output: SamplerOutput | None = None
+        fixed_acceptance_outcome = None
         if self.speculative_config is not None and (
             self.speculative_config.method == "asymspec"
         ):
             from vllm.v1.spec_decode.asymspec.target_diagnostic import (
+                build_asymspec_fixed_acceptance_outcome,
                 capture_asymspec_verifier_rows,
+                persist_asymspec_fixed_acceptance_outcome,
+            )
+            from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+                DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH,
             )
 
             captured_verifier_rows = capture_asymspec_verifier_rows(
@@ -4757,6 +4820,22 @@ class GPUModelRunner(
                 requests=self.requests,
                 is_asymspec=True,
             )
+            fixed_acceptance_outcome = build_asymspec_fixed_acceptance_outcome(
+                scheduler_output=scheduler_output,
+                spec_decode_metadata=spec_decode_metadata,
+                logits=logits,
+                requests=self.requests,
+                is_asymspec=True,
+            )
+            if fixed_acceptance_outcome is not None:
+                cached_request = self.requests[fixed_acceptance_outcome.request_id]
+                cached_request._asymspec_fixed_acceptance_consumed = True
+                cached_request._asymspec_fixed_acceptance_index = (
+                    getattr(cached_request, "_asymspec_fixed_acceptance_index", 0) + 1
+                )
+                persist_asymspec_fixed_acceptance_outcome(
+                    fixed_acceptance_outcome, self.requests
+                )
             live_capture_request_ids = {
                 request_id
                 for request_id in scheduler_output.scheduled_spec_decode_tokens
@@ -4765,6 +4844,17 @@ class GPUModelRunner(
                     and request.sampling_params is not None
                     and request.sampling_params.extra_args is not None
                     and "asymspec_live_full_prompt_token_ids"
+                    in request.sampling_params.extra_args
+                )
+            }
+            control_capture_request_ids = {
+                request_id
+                for request_id in scheduler_output.scheduled_spec_decode_tokens
+                if (
+                    (request := self.requests.get(request_id)) is not None
+                    and request.sampling_params is not None
+                    and request.sampling_params.extra_args is not None
+                    and DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH
                     in request.sampling_params.extra_args
                 )
             }
@@ -4779,7 +4869,10 @@ class GPUModelRunner(
                     if runtime is not None:
                         runtime.rollback_and_release()
 
-            if captured_verifier_rows and live_capture_request_ids:
+            disposable_capture_request_ids = (
+                live_capture_request_ids | control_capture_request_ids
+            )
+            if captured_verifier_rows and disposable_capture_request_ids:
                 # This diagnostic's sole product is the pre-sampling
                 # verifier rows. RejectionSampler requires an acceptance
                 # decision and would otherwise mutate a request deliberately
@@ -4790,23 +4883,37 @@ class GPUModelRunner(
                     raise RuntimeError(
                         "AsymSpec live verifier diagnostic requires sync scheduling."
                     )
-                self._draft_token_ids = None
-                self._draft_probs = None
-                self._draft_prob_req_ids = None
-                self._draft_token_req_ids = None
-                self.valid_sampled_token_count_gpu = None
-                self.input_batch.prev_sampled_token_ids = None
-                return ModelRunnerOutput(
-                    req_ids=self.input_batch.req_ids.copy(),
-                    req_id_to_index=self.input_batch.req_id_to_index.copy(),
-                    sampled_token_ids=[[] for _ in range(self.input_batch.num_reqs)],
-                    asymspec_live_capture_complete=live_capture_request_ids,
-                    kv_connector_output=self.kv_connector_output,
-                )
+                if fixed_acceptance_outcome is not None:
+                    # Continue below through the unmodified native bookkeeping
+                    # path.  The result has the same padded layout as a normal
+                    # rejection sampler output, so V1 owns rollback, hybrid
+                    # post-processing, output append, and the next seed.
+                    sampler_output = SamplerOutput(
+                        sampled_token_ids=fixed_acceptance_outcome.output_token_ids,
+                        logprobs_tensors=None,
+                    )
+                else:
+                    self._draft_token_ids = None
+                    self._draft_probs = None
+                    self._draft_prob_req_ids = None
+                    self._draft_token_req_ids = None
+                    self.valid_sampled_token_count_gpu = None
+                    self.input_batch.prev_sampled_token_ids = None
+                    return ModelRunnerOutput(
+                        req_ids=self.input_batch.req_ids.copy(),
+                        req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                        sampled_token_ids=[
+                            [] for _ in range(self.input_batch.num_reqs)
+                        ],
+                        asymspec_live_capture_complete=disposable_capture_request_ids,
+                        kv_connector_output=self.kv_connector_output,
+                    )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        if sampler_output is None:
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
+        assert sampler_output is not None
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -5034,6 +5141,14 @@ class GPUModelRunner(
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
                 asymspec_live_spec_token_ids=asymspec_live_spec_token_ids,
+                asymspec_fixed_acceptance_counts=(
+                    {}
+                    if fixed_acceptance_outcome is None
+                    else {
+                        fixed_acceptance_outcome.request_id:
+                        fixed_acceptance_outcome.accepted_count
+                    }
+                ),
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
