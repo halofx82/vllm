@@ -319,6 +319,19 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # AsymSpec-only diagnostic handoff.  The map transports the live K=2
+    # pair generated inside TP workers after the target bootstrap seed has
+    # been sampled.  It is always empty for ordinary vLLM requests.
+    asymspec_live_spec_token_ids: dict[str, tuple[int, int]] = field(
+        default_factory=dict
+    )
+
+    # An explicitly disposable live-verifier diagnostic captured t0/t1/t2.
+    # The scheduler finishes these requests without routing them through the
+    # ordinary speculative rejection sampler or acceptance bookkeeping.
+    # Empty for every normal vLLM request, including normal speculation.
+    asymspec_live_capture_complete: set[str] = field(default_factory=set)
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

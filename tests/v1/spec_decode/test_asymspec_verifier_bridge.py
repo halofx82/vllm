@@ -5,12 +5,20 @@ import pytest
 import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.spec_decode.asymspec.live_iteration import _live_prompt_ids
 from vllm.v1.spec_decode.asymspec.target_diagnostic import (
     capture_asymspec_verifier_rows,
 )
 from vllm.v1.spec_decode.asymspec.verifier_bridge import (
     DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_BASE_LAG_TOKENS,
+    DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_OUTPUT_PATH,
+    DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS,
     DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
+    arm_asymspec_live_spec_tokens,
     register_asymspec_diagnostic_spec_tokens,
 )
 
@@ -49,6 +57,65 @@ def test_non_asymspec_bridge_is_a_noop():
     assert request.spec_token_ids == []
 
 
+def test_live_bridge_arms_only_at_the_uncomputed_seed_boundary():
+    request = _request(
+        extra_args={
+            DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1, 2],
+            DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1, 2],
+            DIAGNOSTIC_LIVE_OUTPUT_PATH: "/tmp/live.pt",
+        }
+    )
+    request._output_token_ids = [31]
+    request.num_output_tokens = 1
+    request.num_computed_tokens = 2
+    request.num_prompt_tokens = 2
+
+    assert arm_asymspec_live_spec_tokens(
+        request, SimpleNamespace(method="asymspec"), (13, 17)
+    )
+    assert request.spec_token_ids == [13, 17]
+    assert request._asymspec_live_seed_token_id == 31
+
+
+def test_live_bridge_rejects_a_computed_or_missing_seed():
+    request = _request(
+        extra_args={
+            DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1],
+            DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1],
+            DIAGNOSTIC_LIVE_OUTPUT_PATH: "/tmp/live.pt",
+        }
+    )
+    request._output_token_ids = [31]
+    request.num_output_tokens = 1
+    request.num_prompt_tokens = 1
+    request.num_computed_tokens = 2
+    with pytest.raises(RuntimeError, match="uncomputed"):
+        arm_asymspec_live_spec_tokens(
+            request, SimpleNamespace(method="asymspec"), (13, 17)
+        )
+
+
+def test_live_preseed_commits_are_the_only_deferred_base_range():
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={
+                DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1, 2],
+                DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1, 2],
+                DIAGNOSTIC_LIVE_OUTPUT_PATH: "/tmp/live.pt",
+                DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS: [3, 4, 5],
+                DIAGNOSTIC_LIVE_BASE_LAG_TOKENS: 2,
+            }
+        )
+    )
+    assert _live_prompt_ids(request) == (
+        [1, 2],
+        [1, 2],
+        [3, 4, 5],
+        "/tmp/live.pt",
+        2,
+    )
+
+
 def test_scheduler_transports_asymspec_pair_through_normal_v1_path():
     scheduler = create_scheduler(num_speculative_tokens=2)
     assert scheduler.vllm_config.speculative_config is not None
@@ -70,6 +137,61 @@ def test_scheduler_transports_asymspec_pair_through_normal_v1_path():
     assert output.scheduled_spec_decode_tokens[request.request_id] == [13, 17]
     # The generic scheduler consumed the request-side transport field.
     assert request.spec_token_ids == []
+
+
+def test_scheduler_finishes_live_capture_without_sampling():
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    assert scheduler.vllm_config.speculative_config is not None
+    scheduler.vllm_config.speculative_config.method = "asymspec"
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    assert request.sampling_params is not None
+    request.sampling_params.extra_args = {
+        DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1, 2],
+        DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1, 2],
+        DIAGNOSTIC_LIVE_OUTPUT_PATH: "/tmp/live.pt",
+    }
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    req_id = request.request_id
+    assert req_id in scheduler.requests
+
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[]],
+            asymspec_live_capture_complete={req_id},
+        ),
+    )
+
+    assert req_id not in scheduler.requests
+    assert req_id in scheduler.finished_req_ids
+
+
+def test_live_capture_marker_does_not_finish_non_asymspec_request():
+    scheduler = create_scheduler(num_speculative_tokens=2)
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    assert request.sampling_params is not None
+    request.sampling_params.extra_args = {
+        DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1, 2],
+        DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1, 2],
+        DIAGNOSTIC_LIVE_OUTPUT_PATH: "/tmp/live.pt",
+    }
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    req_id = request.request_id
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[]],
+            asymspec_live_capture_complete={req_id},
+        ),
+    )
+
+    assert req_id in scheduler.requests
 
 
 @pytest.mark.parametrize("tokens", [[13], [13, 17, 19], [13, -1]])
@@ -134,3 +256,38 @@ def test_verifier_capture_is_inert_for_non_asymspec():
         requests={},
         is_asymspec=False,
     )
+
+
+def test_live_verifier_capture_merges_draft_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    output_path = tmp_path / "live.pt"
+    torch.save({"candidate_token_ids": (13, 17), "a0": torch.ones(6)}, output_path)
+    request_id = "live"
+    requests = {
+        request_id: SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                extra_args={
+                    DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1],
+                    DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1],
+                    DIAGNOSTIC_LIVE_OUTPUT_PATH: str(output_path),
+                }
+            )
+        )
+    }
+    assert capture_asymspec_verifier_rows(
+        scheduler_output=SimpleNamespace(
+            scheduled_spec_decode_tokens={request_id: [13, 17]}
+        ),
+        spec_decode_metadata=SimpleNamespace(
+            num_draft_tokens=[2],
+            target_logits_indices=torch.tensor([0, 1]),
+            bonus_logits_indices=torch.tensor([2]),
+        ),
+        logits=torch.arange(18, dtype=torch.float32).reshape(3, 6),
+        requests=requests,
+        is_asymspec=True,
+    )
+    saved = torch.load(output_path, weights_only=False)
+    assert torch.equal(saved["a0"], torch.ones(6))
+    assert saved["candidate_token_ids"] == [13, 17]
+    assert saved["t0"].shape == (6,)

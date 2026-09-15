@@ -4750,13 +4750,59 @@ class GPUModelRunner(
                 capture_asymspec_verifier_rows,
             )
 
-            capture_asymspec_verifier_rows(
+            captured_verifier_rows = capture_asymspec_verifier_rows(
                 scheduler_output=scheduler_output,
                 spec_decode_metadata=spec_decode_metadata,
                 logits=logits,
                 requests=self.requests,
                 is_asymspec=True,
             )
+            live_capture_request_ids = {
+                request_id
+                for request_id in scheduler_output.scheduled_spec_decode_tokens
+                if (
+                    (request := self.requests.get(request_id)) is not None
+                    and request.sampling_params is not None
+                    and request.sampling_params.extra_args is not None
+                    and "asymspec_live_full_prompt_token_ids"
+                    in request.sampling_params.extra_args
+                )
+            }
+            # The live diagnostic deliberately ends after this disposable
+            # verifier forward.  Candidate rows have already been captured;
+            # release only draft-local disposable state before the ordinary
+            # sampler chooses a token that this diagnostic ignores.
+            active_live = getattr(self, "_asymspec_live_iterations", None)
+            if active_live:
+                for request_id in scheduler_output.scheduled_spec_decode_tokens:
+                    runtime = active_live.pop(request_id, None)
+                    if runtime is not None:
+                        runtime.rollback_and_release()
+
+            if captured_verifier_rows and live_capture_request_ids:
+                # This diagnostic's sole product is the pre-sampling
+                # verifier rows. RejectionSampler requires an acceptance
+                # decision and would otherwise mutate a request deliberately
+                # discarded by this experiment. The scheduler receives the
+                # explicit completion marker below and uses its normal finish
+                # and block-free machinery.
+                if self.use_async_scheduling:
+                    raise RuntimeError(
+                        "AsymSpec live verifier diagnostic requires sync scheduling."
+                    )
+                self._draft_token_ids = None
+                self._draft_probs = None
+                self._draft_prob_req_ids = None
+                self._draft_token_req_ids = None
+                self.valid_sampled_token_count_gpu = None
+                self.input_batch.prev_sampled_token_ids = None
+                return ModelRunnerOutput(
+                    req_ids=self.input_batch.req_ids.copy(),
+                    req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                    sampled_token_ids=[[] for _ in range(self.input_batch.num_reqs)],
+                    asymspec_live_capture_complete=live_capture_request_ids,
+                    kv_connector_output=self.kv_connector_output,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -4904,6 +4950,51 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        asymspec_live_spec_token_ids: dict[str, tuple[int, int]] = {}
+        if self.speculative_config is not None and (
+            self.speculative_config.method == "asymspec"
+        ):
+            from vllm.v1.spec_decode.asymspec.live_iteration import (
+                begin_asymspec_live_iteration,
+            )
+            from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+                DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
+            )
+
+            active_live = getattr(self, "_asymspec_live_iterations", None)
+            if active_live is None:
+                active_live = {}
+                self._asymspec_live_iterations = active_live
+            for request_id, token_ids in zip(
+                req_ids_output_copy, valid_sampled_token_ids, strict=True
+            ):
+                cached = self.requests.get(request_id)
+                params = None if cached is None else cached.sampling_params
+                extra_args = None if params is None else params.extra_args
+                if (
+                    not extra_args
+                    or DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS not in extra_args
+                    or request_id in active_live
+                    or request_id in scheduler_output.scheduled_spec_decode_tokens
+                ):
+                    continue
+                if len(token_ids) != 1:
+                    raise RuntimeError(
+                        "AsymSpec live diagnostic bootstrap must sample one seed."
+                    )
+                runtime = begin_asymspec_live_iteration(
+                    runner=self, request=cached, seed_token_id=int(token_ids[0])
+                )
+                if runtime is None:
+                    continue
+                active_live[request_id] = runtime
+                asymspec_live_spec_token_ids[request_id] = (
+                    runtime.candidate_token_ids
+                )
+                if (not torch.distributed.is_initialized()
+                        or torch.distributed.get_rank() == 0):
+                    runtime.write_draft_capture()
+
         if draft_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4942,6 +5033,7 @@ class GPUModelRunner(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
+                asymspec_live_spec_token_ids=asymspec_live_spec_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,

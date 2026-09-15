@@ -40,16 +40,6 @@ from .draft_forward import (
     qwen3_5_text_positions,
 )
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
-from .target_diagnostic import (
-    AsymSpecTargetRowCapture,
-    capture_asymspec_verifier_rows,
-)
-from .verifier_bridge import (
-    DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
-    DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
-    activate_asymspec_diagnostic_spec_tokens,
-    register_asymspec_diagnostic_spec_tokens,
-)
 from .execution_metadata import (
     AsymSpecMetadataGroup,
     AsymSpecViewExecutionMetadata,
@@ -57,6 +47,7 @@ from .execution_metadata import (
     recurrent_page_ids,
 )
 from .hybrid import AsymSpecHybridStateSpec
+from .live_iteration import AsymSpecLiveIterationRuntime, begin_asymspec_live_iteration
 from .logical_cache import (
     AsymSpecLogicalBlockPoolRuntime,
     AsymSpecLogicalCacheGroup,
@@ -83,6 +74,22 @@ from .request_state import (
     AsymSpecRequestState,
     create_asymspec_request_state,
 )
+from .target_diagnostic import (
+    AsymSpecTargetRowCapture,
+    capture_asymspec_verifier_rows,
+)
+from .verifier_bridge import (
+    DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_BASE_LAG_TOKENS,
+    DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_OUTPUT_PATH,
+    DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS,
+    DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
+    activate_asymspec_diagnostic_spec_tokens,
+    arm_asymspec_live_spec_tokens,
+    register_asymspec_diagnostic_spec_tokens,
+)
 from .views import (
     AsymSpecDraftLoadMemory,
     AsymSpecDraftViews,
@@ -106,7 +113,15 @@ __all__ = [
     "AsymSpecTargetRowCapture",
     "capture_asymspec_verifier_rows",
     "DIAGNOSTIC_CANDIDATE_TOKEN_IDS",
+    "DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS",
+    "DIAGNOSTIC_LIVE_BASE_LAG_TOKENS",
+    "DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS",
+    "DIAGNOSTIC_LIVE_OUTPUT_PATH",
+    "DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS",
     "DIAGNOSTIC_VERIFIER_OUTPUT_PATH",
+    "AsymSpecLiveIterationRuntime",
+    "arm_asymspec_live_spec_tokens",
+    "begin_asymspec_live_iteration",
     "activate_asymspec_diagnostic_spec_tokens",
     "register_asymspec_diagnostic_spec_tokens",
     "AsymSpecDraftCacheBinding",

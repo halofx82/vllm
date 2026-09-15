@@ -12,10 +12,17 @@ if TYPE_CHECKING:
 
 DIAGNOSTIC_CANDIDATE_TOKEN_IDS = "asymspec_diagnostic_candidate_token_ids"
 DIAGNOSTIC_VERIFIER_OUTPUT_PATH = "asymspec_diagnostic_verifier_output_path"
+DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS = "asymspec_live_full_prompt_token_ids"
+DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS = "asymspec_live_base_prompt_token_ids"
+DIAGNOSTIC_LIVE_OUTPUT_PATH = "asymspec_live_output_path"
+DIAGNOSTIC_LIVE_BASE_LAG_TOKENS = "asymspec_live_base_lag_tokens"
+DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS = (
+    "asymspec_live_preseed_committed_token_ids"
+)
 
 
 def register_asymspec_diagnostic_spec_tokens(
-    request: "Request", speculative_config: "SpeculativeConfig | None"
+    request: Request, speculative_config: SpeculativeConfig | None
 ) -> bool:
     """Register one explicit FULL K=2 pair for normal V1 scheduling.
 
@@ -27,7 +34,20 @@ def register_asymspec_diagnostic_spec_tokens(
         return False
     params = request.sampling_params
     extra_args = None if params is None else params.extra_args
-    if not extra_args or DIAGNOSTIC_CANDIDATE_TOKEN_IDS not in extra_args:
+    if not extra_args:
+        return False
+    # A live pair is generated inside the TP workers only after V1 has
+    # sampled its canonical-but-uncomputed seed.  It is installed from the
+    # ModelRunnerOutput in ``arm_asymspec_live_spec_tokens`` below.
+    if DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS in extra_args:
+        required = (
+            DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
+            DIAGNOSTIC_LIVE_OUTPUT_PATH,
+        )
+        if any(key not in extra_args for key in required):
+            raise ValueError("AsymSpec live diagnostic is missing required metadata.")
+        return True
+    if DIAGNOSTIC_CANDIDATE_TOKEN_IDS not in extra_args:
         return False
     if request.spec_token_ids or hasattr(
         request, "_asymspec_diagnostic_pending_spec_token_ids"
@@ -39,7 +59,9 @@ def register_asymspec_diagnostic_spec_tokens(
     if not isinstance(tokens, (list, tuple)) or len(tokens) != 2:
         raise ValueError("AsymSpec diagnostic verifier requires exactly K=2 tokens.")
     if not all(isinstance(token, int) and token >= 0 for token in tokens):
-        raise ValueError("AsymSpec diagnostic verifier token IDs must be non-negative ints.")
+        raise ValueError(
+            "AsymSpec diagnostic verifier token IDs must be non-negative ints."
+        )
     if DIAGNOSTIC_VERIFIER_OUTPUT_PATH not in extra_args:
         raise ValueError("AsymSpec diagnostic verifier requires an output path.")
     request._asymspec_diagnostic_pending_spec_token_ids = [
@@ -48,8 +70,45 @@ def register_asymspec_diagnostic_spec_tokens(
     return True
 
 
+def arm_asymspec_live_spec_tokens(
+    request: Request,
+    speculative_config: SpeculativeConfig | None,
+    candidate_token_ids: tuple[int, int] | list[int] | None,
+) -> bool:
+    """Install a TP-produced pair after V1 has appended exactly one seed.
+
+    This is deliberately a narrow diagnostic bridge.  It does not alter the
+    scheduler's normal speculative handling; it only supplies the ordinary
+    ``Request.spec_token_ids`` field at the native seed boundary.
+    """
+    if speculative_config is None or speculative_config.method != "asymspec":
+        return False
+    params = request.sampling_params
+    extra_args = None if params is None else params.extra_args
+    if not extra_args or DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS not in extra_args:
+        return False
+    if candidate_token_ids is None:
+        raise RuntimeError("AsymSpec live diagnostic did not return a K=2 pair.")
+    tokens = [int(token) for token in candidate_token_ids]
+    if len(tokens) != 2 or any(token < 0 for token in tokens):
+        raise ValueError("AsymSpec live diagnostic requires exactly two token IDs.")
+    if request.spec_token_ids:
+        raise RuntimeError("AsymSpec live diagnostic cannot overwrite spec tokens.")
+    if request.num_output_tokens != 1:
+        raise RuntimeError(
+            "AsymSpec live diagnostic must arm immediately after one seed output."
+        )
+    if request.num_computed_tokens != request.num_prompt_tokens:
+        raise RuntimeError(
+            "AsymSpec live diagnostic seed must remain uncomputed at arming."
+        )
+    request.spec_token_ids = tokens
+    request._asymspec_live_seed_token_id = request._output_token_ids[-1]
+    return True
+
+
 def activate_asymspec_diagnostic_spec_tokens(
-    request: "Request", speculative_config: "SpeculativeConfig | None"
+    request: Request, speculative_config: SpeculativeConfig | None
 ) -> bool:
     """Move a registered pair into V1's normal request-side spec field."""
     if speculative_config is None or speculative_config.method != "asymspec":

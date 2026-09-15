@@ -11,6 +11,8 @@ import torch
 
 from .verifier_bridge import (
     DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
+    DIAGNOSTIC_LIVE_OUTPUT_PATH,
     DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
 )
 
@@ -50,10 +52,10 @@ class AsymSpecTargetRowCapture:
 
 def capture_asymspec_verifier_rows(
     *,
-    scheduler_output: "SchedulerOutput",
-    spec_decode_metadata: "SpecDecodeMetadata | None",
+    scheduler_output: SchedulerOutput,
+    spec_decode_metadata: SpecDecodeMetadata | None,
     logits: torch.Tensor | None,
-    requests: dict[str, "CachedRequestState"],
+    requests: dict[str, CachedRequestState],
     is_asymspec: bool,
 ) -> bool:
     """Persist t0/t1/t2 selected by the normal V1 verifier metadata."""
@@ -64,13 +66,27 @@ def capture_asymspec_verifier_rows(
         state = requests.get(request_id)
         params = None if state is None else state.sampling_params
         extra_args = None if params is None else params.extra_args
-        if not extra_args or DIAGNOSTIC_CANDIDATE_TOKEN_IDS not in extra_args:
+        if not extra_args:
             continue
-        expected = [int(token) for token in extra_args[DIAGNOSTIC_CANDIDATE_TOKEN_IDS]]
+        is_live = DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS in extra_args
+        if not is_live and DIAGNOSTIC_CANDIDATE_TOKEN_IDS not in extra_args:
+            continue
+        expected = (
+            [int(token) for token in scheduled]
+            if is_live
+            else [int(token) for token in extra_args[DIAGNOSTIC_CANDIDATE_TOKEN_IDS]]
+        )
         if list(scheduled) != expected:
-            raise RuntimeError("Scheduled verifier tokens differ from supplied FULL pair.")
+            raise RuntimeError(
+                "Scheduled verifier tokens differ from supplied FULL pair."
+            )
+        output_key = (
+            DIAGNOSTIC_LIVE_OUTPUT_PATH if is_live else DIAGNOSTIC_VERIFIER_OUTPUT_PATH
+        )
+        if output_key not in extra_args:
+            raise ValueError("AsymSpec verifier diagnostic is missing an output path.")
         diagnostic.append(
-            (request_id, expected, str(extra_args[DIAGNOSTIC_VERIFIER_OUTPUT_PATH]))
+            (request_id, expected, str(extra_args[output_key]))
         )
     if not diagnostic:
         return False
@@ -81,7 +97,9 @@ def capture_asymspec_verifier_rows(
     target_indices = spec_decode_metadata.target_logits_indices.detach().cpu()
     bonus_indices = spec_decode_metadata.bonus_logits_indices.detach().cpu()
     if target_indices.numel() != 2 or bonus_indices.numel() != 1:
-        raise RuntimeError("AsymSpec verifier diagnostic received unexpected row counts.")
+        raise RuntimeError(
+            "AsymSpec verifier diagnostic received unexpected row counts."
+        )
     writer = (not torch.distributed.is_initialized()
               or torch.distributed.get_rank() == 0)
     if writer:
@@ -89,8 +107,7 @@ def capture_asymspec_verifier_rows(
             torch.cuda.synchronize(logits.device)
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
+        capture = {
                 "request_id": request_id,
                 "candidate_token_ids": tokens,
                 "scheduled_spec_decode_tokens": tokens,
@@ -99,7 +116,14 @@ def capture_asymspec_verifier_rows(
                 "t0": logits[int(target_indices[0])].detach().cpu().to(torch.bfloat16),
                 "t1": logits[int(target_indices[1])].detach().cpu().to(torch.bfloat16),
                 "t2": logits[int(bonus_indices[0])].detach().cpu().to(torch.bfloat16),
-            },
-            path,
-        )
+        }
+        # The live draft coordinator writes a/b before V1 schedules the
+        # verifier.  Merge rather than replace that one diagnostic bundle.
+        if path.exists():
+            existing = torch.load(path, weights_only=False)
+            if tuple(existing.get("candidate_token_ids", ())) != tuple(tokens):
+                raise RuntimeError("Live draft/target candidate pairs disagree.")
+            existing.update(capture)
+            capture = existing
+        torch.save(capture, path)
     return True
