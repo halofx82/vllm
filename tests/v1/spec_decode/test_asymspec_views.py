@@ -463,6 +463,129 @@ def test_canonical_driver_does_not_advance_state_on_forward_failure(monkeypatch)
     state.release()
 
 
+def test_deferred_base_observes_then_catches_up_once(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    calls = []
+
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"],
+            query_len=kwargs["query_len"],
+            query_start=kwargs["query_start"],
+        ),
+    )
+
+    def execute(**kwargs):
+        calls.append((kwargs["input_ids"].tolist(), kwargs["metadata"].query_start))
+        return SimpleNamespace(role=kwargs["role"], logits=torch.tensor([[1.0]]))
+
+    monkeypatch.setattr(
+        canonical_driver_module, "execute_asymspec_draft_forward", execute
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.BASE,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    driver.begin_deferred_base()
+    driver.observe_committed_token(5)
+    driver.observe_committed_token(6)
+    assert state.compressed.canonical_len == state.base.observed_len == 6
+    assert state.base.canonical_len == 4
+    assert state.base.pending_token_ids == [5, 6]
+
+    driver.catch_up_base()
+    assert calls == [([1, 2, 3, 4], 0), ([5, 6], 4)]
+    assert state.base.canonical_len == state.base.observed_len == 6
+    assert state.base.pending_token_ids == []
+    assert driver.counters.catch_up_forward_calls == 1
+    assert driver.counters.catch_up_tokens_processed == 2
+    assert driver.counters.replayed_historical_tokens == 0
+    state.release()
+
+
+def test_deferred_base_catch_up_is_metadata_transactional(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_len=kwargs["query_len"]
+        ),
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "execute_asymspec_draft_forward",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], logits=torch.tensor([[1.0]])
+        ),
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.BASE,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    driver.begin_deferred_base()
+    driver.observe_committed_token(5)
+    original_forward = canonical_driver_module.execute_asymspec_draft_forward
+
+    def fail(**kwargs):
+        if kwargs["input_ids"].numel() == 1:
+            raise RuntimeError("catch-up failed")
+        return original_forward(**kwargs)
+
+    monkeypatch.setattr(canonical_driver_module, "execute_asymspec_draft_forward", fail)
+    with pytest.raises(RuntimeError, match="catch-up failed"):
+        driver.catch_up_base()
+    assert state.base.canonical_len == 4
+    assert state.base.observed_len == state.compressed.canonical_len == 5
+    assert state.base.pending_token_ids == [5]
+    assert driver.counters.catch_up_tokens_processed == 0
+    state.release()
+
+
+def test_deferred_base_long_lag_crosses_attention_blocks():
+    _, _, _, logical_runtime, _ = _bind_metadata_test_runtime(
+        full_max_model_len=4096,
+        compressed_max_model_len=4096,
+    )
+    state = create_asymspec_request_state(
+        request_id="deferred-long-lag",
+        compressed_prompt_len=800,
+        full_prompt_len=800,
+        augmentation_offset=0,
+        logical_pools=logical_runtime,
+    )
+    state.advance_target(list(range(900)))
+    assert state.base.canonical_len == 800
+    assert state.base.observed_len == state.compressed.canonical_len == 1700
+    assert len(state.block_tables.attention_block_ids(
+        AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
+    )) == 3
+    assert state.catch_up_base() == tuple(range(900))
+    assert state.base.canonical_len == 1700
+    assert state.base.pending_token_ids == []
+    state.release()
+
+
 def _make_kv_spec_runner(config, views):
     return SimpleNamespace(
         vllm_config=config,

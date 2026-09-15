@@ -177,6 +177,24 @@ class AsymSpecRequestState:
     full: AsymSpecFullCoordinates
     block_tables: AsymSpecRequestBlockTables
 
+    def begin_deferred_base_observation(self) -> None:
+        """Align the observed TARGET boundary with an already-prefilled BASE.
+
+        The canonical driver intentionally permits an isolated BASE prefill
+        before TARGET execution exists.  This one-time transition establishes
+        the frozen deferred-BASE invariant: prompt tokens are already
+        canonical in both compressed views and the pending queue starts empty.
+        """
+        if self.compressed.canonical_len != 0:
+            raise RuntimeError("Deferred BASE observation was already initialized.")
+        if self.base.pending_token_ids:
+            raise AssertionError("Deferred BASE cannot start with pending tokens.")
+        if self.base.observed_len != self.base.canonical_len:
+            raise AssertionError(
+                "BASE observed boundary must equal its canonical boundary."
+            )
+        self.compressed.canonical_len = self.base.canonical_len
+
     def advance_full(self, num_tokens: int) -> range:
         if num_tokens < 0:
             raise ValueError("FULL advancement must be non-negative.")

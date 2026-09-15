@@ -780,6 +780,177 @@ class Worker(WorkerBase):
             "base": run(AsymSpecViewRole.BASE),
         }
 
+    def run_asymspec_deferred_base_parity(
+        self, prompt_token_ids: list[int], reference_token_ids: list[int]
+    ) -> dict[str, object]:
+        """Run frozen-style deferred BASE catch-up schedules inside one worker.
+
+        This is an AsymSpec-only diagnostic RPC.  It intentionally has no
+        scheduler, verifier, or speculative-decoding participation.
+        """
+        if self.vllm_config.speculative_config is None or (
+            self.vllm_config.speculative_config.method != "asymspec"
+        ):
+            raise RuntimeError(
+                "run_asymspec_deferred_base_parity requires method='asymspec'."
+            )
+        import torch
+
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        from vllm.v1.spec_decode.asymspec import (
+            AsymSpecCanonicalDraftDriver,
+            AsymSpecViewRole,
+            allocate_asymspec_physical_cache_tensors,
+            bind_asymspec_draft_caches,
+            build_asymspec_domain_allocation_plans,
+            build_asymspec_logical_cache_plan,
+            build_asymspec_physical_cache_plan,
+            compose_asymspec_global_cache_plan,
+            create_asymspec_request_state,
+            instantiate_asymspec_logical_block_pools,
+        )
+
+        if len(reference_token_ids) < 128:
+            raise ValueError("Deferred BASE parity requires at least 128 tokens.")
+        runner = self.model_runner
+        views = getattr(runner, "asymspec_draft_views", None)
+        if views is None:
+            raise RuntimeError("AsymSpec draft views are not initialized.")
+        device = self.device
+        prompt = torch.tensor(prompt_token_ids, dtype=torch.int32, device=device)
+        tokens = [int(token) for token in reference_token_ids[:128]]
+        target_specs = runner.get_kv_cache_spec()
+        global_plan = compose_asymspec_global_cache_plan(
+            vllm_config=runner.vllm_config,
+            target_specs=target_specs,
+            full_plan=views.full.state.cache_plan,
+            base_plan=views.base.state.cache_plan,
+        )
+        domain_plans = build_asymspec_domain_allocation_plans(
+            global_plan=global_plan,
+            full_max_model_len=max(len(prompt_token_ids) + len(tokens), 256),
+            compressed_max_model_len=max(len(prompt_token_ids) + len(tokens), 256),
+        )
+        physical = allocate_asymspec_physical_cache_tensors(
+            plan=build_asymspec_physical_cache_plan(
+                global_plan=global_plan, domain_plans=domain_plans
+            ),
+            device=device,
+        )
+        logical = instantiate_asymspec_logical_block_pools(
+            build_asymspec_logical_cache_plan(physical.plan)
+        )
+        bindings = bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=physical,
+            global_plan=global_plan,
+            logical_pools=logical,
+            vllm_config=runner.vllm_config,
+        )
+
+        def make_driver(label: str) -> tuple[AsymSpecCanonicalDraftDriver, object]:
+            state = create_asymspec_request_state(
+                request_id=label,
+                compressed_prompt_len=len(prompt_token_ids),
+                full_prompt_len=len(prompt_token_ids),
+                augmentation_offset=0,
+                logical_pools=logical,
+                canonical_prompt_processed=False,
+                device=device,
+            )
+            return (
+                AsymSpecCanonicalDraftDriver(
+                    role=AsymSpecViewRole.BASE,
+                    request_state=state,
+                    views=views,
+                    cache_bindings=bindings,
+                    vllm_config=runner.vllm_config,
+                    device=device,
+                ),
+                state,
+            )
+
+        def fingerprint(role: AsymSpecViewRole) -> dict[str, tuple[float, ...]]:
+            """Small deterministic fingerprints of representative raw pages."""
+            representatives: dict[str, object] = {}
+            for binding in bindings.bindings.values():
+                if binding.role is not role:
+                    continue
+                kind = "gdn" if isinstance(binding.module, MambaBase) else "attention"
+                representatives.setdefault(kind, binding)
+            result: dict[str, tuple[float, ...]] = {}
+            for kind, binding in representatives.items():
+                flat = binding.raw_tensor.reshape(-1)
+                stride = max(flat.numel() // 2048, 1)
+                sample = flat[::stride][:2048].to(torch.float32)
+                result[kind] = (
+                    float(sample.sum().item()),
+                    float(sample.abs().sum().item()),
+                    float(torch.count_nonzero(sample).item()),
+                )
+            return result
+
+        continuous, continuous_state = make_driver("deferred-continuous")
+        continuous_predictions = [
+            int(continuous.prefill(prompt).logits.argmax(-1).item())
+        ]
+        for token in tokens:
+            continuous_predictions.append(
+                int(continuous.commit_token(token).logits.argmax(-1).item())
+            )
+        continuous_final = {
+            "prediction": continuous_predictions[-1],
+            "canonical": continuous_state.base.canonical_len,
+            "fingerprint": fingerprint(AsymSpecViewRole.BASE),
+            "counters": continuous.counters.__dict__.copy(),
+        }
+        continuous_state.release()
+
+        schedules = {"A": 2, "B": 8, "C": 32, "D": 128}
+        schedule_results: dict[str, object] = {}
+        full_before = fingerprint(AsymSpecViewRole.FULL)
+        for name, interval in schedules.items():
+            driver, state = make_driver(f"deferred-{name}")
+            driver.prefill(prompt)
+            driver.begin_deferred_base()
+            checkpoints: list[dict[str, object]] = []
+            for index, token in enumerate(tokens, start=1):
+                driver.observe_committed_token(token)
+                if index % interval == 0:
+                    result = driver.catch_up_base()
+                    assert result is not None
+                    prediction = int(result.logits.argmax(-1).item())
+                    checkpoints.append({
+                        "position": index,
+                        "prediction": prediction,
+                        "continuous_prediction": continuous_predictions[index],
+                        "matches": prediction == continuous_predictions[index],
+                        "canonical": state.base.canonical_len,
+                        "observed": state.base.observed_len,
+                        "pending": len(state.base.pending_token_ids),
+                        "fingerprint": fingerprint(AsymSpecViewRole.BASE),
+                    })
+            final = checkpoints[-1]
+            schedule_results[name] = {
+                "interval": interval,
+                "checkpoints": checkpoints,
+                "final_prediction": final["prediction"],
+                "final_matches_continuous": final["matches"],
+                "final_canonical": state.base.canonical_len,
+                "final_observed": state.base.observed_len,
+                "final_pending": len(state.base.pending_token_ids),
+                "final_fingerprint": final["fingerprint"],
+                "counters": driver.counters.__dict__.copy(),
+            }
+            state.release()
+        full_after = fingerprint(AsymSpecViewRole.FULL)
+        return {
+            "rank": self.rank,
+            "continuous": continuous_final,
+            "schedules": schedule_results,
+            "full_fingerprint_unchanged": full_before == full_after,
+        }
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine

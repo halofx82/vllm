@@ -34,11 +34,17 @@ class AsymSpecCanonicalExecutionCounters:
     incremental_forward_calls: int = 0
     prefill_tokens_processed: int = 0
     incremental_tokens_processed: int = 0
+    catch_up_forward_calls: int = 0
+    catch_up_tokens_processed: int = 0
     replayed_historical_tokens: int = 0
 
     @property
     def total_forward_calls(self) -> int:
-        return self.prefill_forward_calls + self.incremental_forward_calls
+        return (
+            self.prefill_forward_calls
+            + self.incremental_forward_calls
+            + self.catch_up_forward_calls
+        )
 
 
 class AsymSpecCanonicalDraftDriver:
@@ -170,4 +176,59 @@ class AsymSpecCanonicalDraftDriver:
         self._advance(1)
         self.counters.incremental_forward_calls += 1
         self.counters.incremental_tokens_processed += 1
+        return result
+
+    def begin_deferred_base(self) -> None:
+        """Start observing TARGET commits while this already-prefilled BASE lags.
+
+        The frozen deferred path begins with BASE fully prefetched through the
+        compressed prompt.  From then on, TARGET advances the observed
+        compressed boundary while BASE retains its last committed boundary.
+        """
+        if self.role is not AsymSpecViewRole.BASE:
+            raise RuntimeError("Only the BASE canonical driver can defer BASE.")
+        if not self._prefilled:
+            raise RuntimeError("BASE must be prefetched before it can defer.")
+        self.request_state.begin_deferred_base_observation()
+
+    def observe_committed_token(self, token_id: int | torch.Tensor) -> None:
+        """Record one authoritative compressed token without executing BASE."""
+        if self.role is not AsymSpecViewRole.BASE:
+            raise RuntimeError(
+                "Only the BASE canonical driver observes deferred tokens."
+            )
+        if not self._prefilled:
+            raise RuntimeError("BASE must be prefetched before deferred observation.")
+        if isinstance(token_id, torch.Tensor):
+            if token_id.numel() != 1:
+                raise ValueError(
+                    "AsymSpec deferred observation needs exactly one token."
+                )
+            token_id = int(token_id.item())
+        self.request_state.advance_target([int(token_id)])
+
+    def catch_up_base(self) -> AsymSpecDraftForwardResult | None:
+        """Run the frozen packed pending range and commit it transactionally.
+
+        No state metadata changes before the packed BASE forward returns.  On
+        a forward failure the canonical boundary, observed boundary, and
+        pending queue therefore remain intact for the caller to inspect or
+        retry.
+        """
+        if self.role is not AsymSpecViewRole.BASE:
+            raise RuntimeError("Only the BASE canonical driver can catch up BASE.")
+        if not self._prefilled:
+            raise RuntimeError("BASE must be prefetched before catch-up.")
+        pending = tuple(self.request_state.base.pending_token_ids)
+        if not pending:
+            return None
+        start = self.request_state.base.canonical_len
+        self._ensure_attention_capacity(start + len(pending))
+        token_ids = torch.tensor(pending, device=self.device, dtype=torch.int32)
+        result = self._forward(token_ids, query_start=start)
+        committed = self.request_state.catch_up_base()
+        if committed != pending:
+            raise AssertionError("Deferred BASE queue changed during catch-up.")
+        self.counters.catch_up_forward_calls += 1
+        self.counters.catch_up_tokens_processed += len(pending)
         return result
