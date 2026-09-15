@@ -40,7 +40,16 @@ from .draft_forward import (
     qwen3_5_text_positions,
 )
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
-from .target_diagnostic import AsymSpecTargetRowCapture
+from .target_diagnostic import (
+    AsymSpecTargetRowCapture,
+    capture_asymspec_verifier_rows,
+)
+from .verifier_bridge import (
+    DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
+    DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
+    activate_asymspec_diagnostic_spec_tokens,
+    register_asymspec_diagnostic_spec_tokens,
+)
 from .execution_metadata import (
     AsymSpecMetadataGroup,
     AsymSpecViewExecutionMetadata,
@@ -95,6 +104,11 @@ __all__ = [
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftSignal",
     "AsymSpecTargetRowCapture",
+    "capture_asymspec_verifier_rows",
+    "DIAGNOSTIC_CANDIDATE_TOKEN_IDS",
+    "DIAGNOSTIC_VERIFIER_OUTPUT_PATH",
+    "activate_asymspec_diagnostic_spec_tokens",
+    "register_asymspec_diagnostic_spec_tokens",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",
     "AsymSpecDraftLoadMemory",

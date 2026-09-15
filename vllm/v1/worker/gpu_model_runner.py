@@ -2643,25 +2643,39 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(
-                    self.drafter,
-                    (
-                        EagleProposer,
-                        DFlashProposer,
-                        Gemma4Proposer,
-                        ExtractHiddenStatesProposer,
-                    ),
-                ):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
-                        spec_decode_common_attn_metadata = cm
-                else:
+                if self.speculative_config.method == "asymspec":
+                    # AsymSpec has no generic V1 drafter. Its draft views are
+                    # driven separately; the target verifier only needs the
+                    # ordinary target attention metadata for this diagnostic.
                     spec_decode_common_attn_metadata = cm
+                else:
+                    if isinstance(
+                        self.drafter,
+                        (
+                            EagleProposer,
+                            DFlashProposer,
+                            Gemma4Proposer,
+                            ExtractHiddenStatesProposer,
+                        ),
+                    ):
+                        if self.drafter.kv_cache_gid == kv_cache_gid:
+                            spec_decode_common_attn_metadata = cm
+                    else:
+                        spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            if (
+                self.speculative_config
+                and self.speculative_config.method != "asymspec"
+                and isinstance(self.drafter, Step3p5MTPProposer)
+            ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            elif (
+                self.speculative_config
+                and self.speculative_config.method != "asymspec"
+                and isinstance(self.drafter, Gemma4Proposer)
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
@@ -4729,6 +4743,21 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        if self.speculative_config is not None and (
+            self.speculative_config.method == "asymspec"
+        ):
+            from vllm.v1.spec_decode.asymspec.target_diagnostic import (
+                capture_asymspec_verifier_rows,
+            )
+
+            capture_asymspec_verifier_rows(
+                scheduler_output=scheduler_output,
+                spec_decode_metadata=spec_decode_metadata,
+                logits=logits,
+                requests=self.requests,
+                is_asymspec=True,
+            )
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -4770,7 +4799,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and spec_config.method != "asymspec":
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
                 spec_decode_common_attn_metadata

@@ -59,6 +59,10 @@ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+    activate_asymspec_diagnostic_spec_tokens,
+    register_asymspec_diagnostic_spec_tokens,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -524,6 +528,9 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            activate_asymspec_diagnostic_spec_tokens(
+                request, self.vllm_config.speculative_config
+            )
             if input_budget <= draft_slots:
                 break
 
@@ -2299,6 +2306,11 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        # Opt-in diagnostic transport only. Once populated, this pair follows
+        # the normal V1 speculative scheduling contract unchanged.
+        register_asymspec_diagnostic_spec_tokens(
+            request, self.vllm_config.speculative_config
+        )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
