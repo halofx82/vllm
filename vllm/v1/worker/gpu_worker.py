@@ -954,7 +954,10 @@ class Worker(WorkerBase):
         }
 
     def run_asymspec_full_candidate_transaction_parity(
-        self, prompt_token_ids: list[int], reference_token_ids: list[int]
+        self,
+        prompt_token_ids: list[int],
+        reference_token_ids: list[int],
+        autonomous_proposals: bool = False,
     ) -> dict[str, object]:
         """Exercise FULL-only K=2 rollback/promotion with supplied tokens.
 
@@ -974,6 +977,7 @@ class Worker(WorkerBase):
         from vllm.v1.spec_decode.asymspec import (
             AsymSpecCanonicalDraftDriver,
             AsymSpecFullCandidateTransaction,
+            AsymSpecFullK2Proposer,
             AsymSpecViewRole,
             allocate_asymspec_physical_cache_tensors,
             bind_asymspec_draft_caches,
@@ -1093,8 +1097,17 @@ class Worker(WorkerBase):
                 predictions.append(
                     int(driver.commit_token(token).logits.argmax(-1).item())
                 )
-            transaction = AsymSpecFullCandidateTransaction(driver)
-            candidate_results = transaction.execute_candidate((tokens[4], tokens[5]))
+            if autonomous_proposals:
+                proposal = AsymSpecFullK2Proposer(driver).propose_k2()
+                transaction = proposal.transaction
+                candidate_results = proposal.candidate_results
+                candidate_ids = proposal.candidate_token_ids
+            else:
+                transaction = AsymSpecFullCandidateTransaction(driver)
+                candidate_results = transaction.execute_candidate(
+                    (tokens[4], tokens[5])
+                )
+                candidate_ids = (tokens[4], tokens[5])
             transaction.promote(accepted)
             for candidate_result in candidate_results[:accepted]:
                 predictions.append(int(candidate_result.logits.argmax(-1).item()))
@@ -1107,6 +1120,8 @@ class Worker(WorkerBase):
             matches = sum(a == b for a, b in zip(predictions, expected))
             result = {
                 "accepted": accepted,
+                "candidate_ids": candidate_ids,
+                "candidate_matches_reference": candidate_ids == (tokens[4], tokens[5]),
                 "matches": matches,
                 "count": len(expected),
                 "continuation_matches": predictions[-64:] == expected[-64:],
@@ -1154,10 +1169,31 @@ class Worker(WorkerBase):
         transaction = AsymSpecFullCandidateTransaction(stress_driver)
         stress_checks: list[bool] = [stress_prediction == control_cycle_predictions[0]]
         consumed = 0
+        candidate_a_matches: list[bool] = []
+        candidate_b_matches: list[bool] = []
+        proposal_forward_counts: list[int] = []
+        transaction_totals = {
+            "transactions": 0,
+            "candidate_tokens_executed": 0,
+            "promoted_tokens": 0,
+            "rollbacks": 0,
+            "replayed_historical_tokens": 0,
+        }
         for cycle in range(64):
             accepted = cycle % 3
-            transaction.execute_candidate((tokens[consumed], tokens[consumed + 1]))
+            if autonomous_proposals:
+                proposal = AsymSpecFullK2Proposer(stress_driver).propose_k2()
+                transaction = proposal.transaction
+                candidate_ids = proposal.candidate_token_ids
+            else:
+                transaction.execute_candidate((tokens[consumed], tokens[consumed + 1]))
+                candidate_ids = (tokens[consumed], tokens[consumed + 1])
+            candidate_a_matches.append(candidate_ids[0] == tokens[consumed])
+            candidate_b_matches.append(candidate_ids[1] == tokens[consumed + 1])
+            proposal_forward_counts.append(2)
             promoted = transaction.promote(accepted)
+            for key in transaction_totals:
+                transaction_totals[key] += getattr(transaction.counters, key)
             if promoted is not None:
                 stress_prediction = int(promoted.logits.argmax(-1).item())
             stress_checks.append(
@@ -1177,9 +1213,14 @@ class Worker(WorkerBase):
             "cycle_count": len(stress_checks),
             "tail_matches": sum(tail_checks),
             "tail_count": len(tail_checks),
+            "candidate_a_matches": sum(candidate_a_matches),
+            "candidate_a_count": len(candidate_a_matches),
+            "candidate_b_matches": sum(candidate_b_matches),
+            "candidate_b_count": len(candidate_b_matches),
+            "proposal_forward_counts": proposal_forward_counts,
             "canonical": stress_state.full.canonical_len,
             "control_canonical": control_state.full.canonical_len,
-            "transaction": transaction.counters.__dict__.copy(),
+            "transaction": transaction_totals,
             "driver": stress_driver.counters.__dict__.copy(),
         }
         stress_state.release()

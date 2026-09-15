@@ -80,6 +80,10 @@ class AsymSpecCanonicalDraftDriver:
         self.device = device
         self.counters = AsymSpecCanonicalExecutionCounters()
         self._prefilled = False
+        # The last successful forward predicts the next canonical token.  It
+        # is retained locally so a greedy proposer can use the prompt-boundary
+        # or committed-token logits without replaying a token.
+        self._last_result: AsymSpecDraftForwardResult | None = None
 
     @property
     def canonical_len(self) -> int:
@@ -96,6 +100,17 @@ class AsymSpecCanonicalDraftDriver:
             if self.role is AsymSpecViewRole.FULL
             else self.request_state.base.prompt_len
         )
+
+    @property
+    def last_result(self) -> AsymSpecDraftForwardResult:
+        """The logits predicting the next token at the canonical boundary."""
+        if self._last_result is None:
+            raise RuntimeError("AsymSpec canonical view has no current logits.")
+        return self._last_result
+
+    def _set_last_result(self, result: AsymSpecDraftForwardResult) -> None:
+        """Record a result only when it represents canonical state."""
+        self._last_result = result
 
     def _ensure_attention_capacity(self, token_count: int) -> None:
         group = (
@@ -161,6 +176,7 @@ class AsymSpecCanonicalDraftDriver:
         )
         result = self._forward(prompt_token_ids, query_start=0)
         self._advance(prompt_token_ids.numel())
+        self._set_last_result(result)
         self._prefilled = True
         self.counters.prefill_forward_calls += 1
         self.counters.prefill_tokens_processed += prompt_token_ids.numel()
@@ -180,6 +196,7 @@ class AsymSpecCanonicalDraftDriver:
         self._ensure_attention_capacity(start + 1)
         result = self._forward(token_ids, query_start=start)
         self._advance(1)
+        self._set_last_result(result)
         self.counters.incremental_forward_calls += 1
         self.counters.incremental_tokens_processed += 1
         return result
@@ -237,4 +254,5 @@ class AsymSpecCanonicalDraftDriver:
             raise AssertionError("Deferred BASE queue changed during catch-up.")
         self.counters.catch_up_forward_calls += 1
         self.counters.catch_up_tokens_processed += len(pending)
+        self._set_last_result(result)
         return result

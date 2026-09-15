@@ -52,6 +52,7 @@ from vllm.v1.spec_decode.asymspec.physical_cache import (
     allocate_asymspec_physical_cache_tensors,
     build_asymspec_physical_cache_plan,
 )
+from vllm.v1.spec_decode.asymspec.proposer import AsymSpecFullK2Proposer
 from vllm.v1.spec_decode.asymspec.request_state import (
     create_asymspec_request_state,
 )
@@ -562,6 +563,103 @@ def test_full_candidate_transaction_rolls_back_and_rejects_double_begin(monkeypa
     assert transaction.counters.rollbacks == 2
     with pytest.raises(RuntimeError, match="not active"):
         transaction.rollback()
+    state.release()
+
+
+def test_full_k2_proposer_reuses_canonical_logits_and_leaves_transaction_active(
+    monkeypatch,
+):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_len=kwargs["query_len"]
+        ),
+    )
+    calls: list[list[int]] = []
+
+    def execute(**kwargs):
+        token_ids = kwargs["input_ids"].tolist()
+        calls.append(token_ids)
+        # prompt -> A=7; consuming A -> B=9; consuming B -> arbitrary.
+        logits = {
+            (1, 2, 3, 4): [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            (7,): [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }.get(tuple(token_ids), [1.0])
+        return SimpleNamespace(
+            role=kwargs["role"], logits=torch.tensor([logits])
+        )
+
+    monkeypatch.setattr(
+        canonical_driver_module, "execute_asymspec_draft_forward", execute
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    proposal = AsymSpecFullK2Proposer(driver).propose_k2()
+    assert proposal.candidate_token_ids == (7, 9)
+    assert proposal.transaction.active
+    assert proposal.transaction.ready_to_promote
+    assert state.full.canonical_len == 4
+    # No forward was spent obtaining A; only A and B were executed.
+    assert calls == [[1, 2, 3, 4], [7], [9]]
+    proposal.transaction.promote(1)
+    assert driver.last_result is proposal.candidate_results[0]
+    assert state.full.canonical_len == 5
+    state.release()
+
+
+def test_full_k2_proposer_always_constructs_two_positions_for_eos_like_argmax(
+    monkeypatch,
+):
+    """Frozen K=2 behavior does not short-circuit the inner loop at EOS."""
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_len=kwargs["query_len"]
+        ),
+    )
+    calls = []
+
+    def execute(**kwargs):
+        calls.append(kwargs["input_ids"].tolist())
+        return SimpleNamespace(
+            role=kwargs["role"], logits=torch.tensor([[1.0, 0.0]])
+        )
+
+    monkeypatch.setattr(
+        canonical_driver_module, "execute_asymspec_draft_forward", execute
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    proposal = AsymSpecFullK2Proposer(driver).propose_k2()
+    assert proposal.candidate_token_ids == (0, 0)
+    assert calls == [[1, 2, 3, 4], [0], [0]]
+    proposal.transaction.rollback()
     state.release()
 
 

@@ -57,6 +57,7 @@ from .physical_cache import (
     allocate_asymspec_physical_cache_tensors,
     build_asymspec_physical_cache_plan,
 )
+from .proposer import AsymSpecFullK2Proposal, AsymSpecFullK2Proposer
 from .request_state import (
     AsymSpecBaseCoordinates,
     AsymSpecCompressedCoordinates,
@@ -79,6 +80,8 @@ __all__ = [
     "AsymSpecCanonicalExecutionCounters",
     "AsymSpecCandidateTransactionCounters",
     "AsymSpecFullCandidateTransaction",
+    "AsymSpecFullK2Proposal",
+    "AsymSpecFullK2Proposer",
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",

@@ -60,6 +60,8 @@ class AsymSpecFullCandidateTransaction:
         self._canonical_snapshot: tuple[_GDNPageSnapshot, ...] = ()
         self._promotable_snapshots: tuple[tuple[_GDNPageSnapshot, ...], ...] = ()
         self._results: tuple[AsymSpecDraftForwardResult, ...] = ()
+        self._first_result: AsymSpecDraftForwardResult | None = None
+        self._first_token_id: int | None = None
 
     @property
     def active(self) -> bool:
@@ -68,6 +70,11 @@ class AsymSpecFullCandidateTransaction:
     @property
     def candidate_token_ids(self) -> tuple[int, int] | None:
         return self._candidate_token_ids
+
+    @property
+    def ready_to_promote(self) -> bool:
+        """Whether both K=2 candidate tokens have been executed."""
+        return self.active and len(self._results) == 2
 
     def _snapshot_gdn_pages(self) -> tuple[_GDNPageSnapshot, ...]:
         """Copy only FULL's compact recurrent pages, never attention KV."""
@@ -96,51 +103,103 @@ class AsymSpecFullCandidateTransaction:
         self._canonical_snapshot = ()
         self._promotable_snapshots = ()
         self._results = ()
+        self._first_result = None
+        self._first_token_id = None
+
+    def begin_candidate(self, candidate_token_id: int) -> AsymSpecDraftForwardResult:
+        """Execute candidate A from canonical logits, without committing it.
+
+        The GDN pages intentionally remain at A's disposable state until
+        :meth:`complete_candidate` obtains B from A's logits.  This mirrors
+        the frozen greedy K=2 sequence and avoids a canonical replay.
+        """
+        if self.active:
+            raise RuntimeError("AsymSpec FULL candidate transaction is already active.")
+        if not self.driver._prefilled:
+            raise RuntimeError("AsymSpec FULL must be prefetched before candidates.")
+        canonical_len = self.driver.canonical_len
+        canonical_snapshot = self._snapshot_gdn_pages()
+        try:
+            self.driver._ensure_attention_capacity(canonical_len + 1)
+            result = self.driver._forward(
+                torch.tensor(
+                    [int(candidate_token_id)],
+                    dtype=torch.int32,
+                    device=self.driver.device,
+                ),
+                query_start=canonical_len,
+                canonical_end=canonical_len,
+                allow_uncommitted_start=True,
+            )
+            first_snapshot = self._snapshot_gdn_pages()
+        except Exception:
+            self._restore_gdn_pages(canonical_snapshot)
+            raise
+        self._canonical_len = canonical_len
+        self._canonical_snapshot = canonical_snapshot
+        self._promotable_snapshots = (first_snapshot,)
+        self._first_result = result
+        self._first_token_id = int(candidate_token_id)
+        return result
+
+    def complete_candidate(self, candidate_token_id: int) -> AsymSpecDraftForwardResult:
+        """Execute candidate B from A's disposable state, then restore GDN."""
+        if not self.active or self._first_result is None:
+            raise RuntimeError("AsymSpec FULL candidate transaction was not begun.")
+        if self.ready_to_promote:
+            raise RuntimeError("AsymSpec FULL candidate transaction is complete.")
+        assert self._canonical_len is not None
+        try:
+            start = self._canonical_len + 1
+            self.driver._ensure_attention_capacity(start + 1)
+            result = self.driver._forward(
+                torch.tensor(
+                    [int(candidate_token_id)],
+                    dtype=torch.int32,
+                    device=self.driver.device,
+                ),
+                query_start=start,
+                canonical_end=start,
+                allow_uncommitted_start=True,
+            )
+            second_snapshot = self._snapshot_gdn_pages()
+        except Exception:
+            self._restore_gdn_pages(self._canonical_snapshot)
+            self._clear()
+            raise
+        self._restore_gdn_pages(self._canonical_snapshot)
+        first_token = self._first_result_token_id
+        self._candidate_token_ids = (first_token, int(candidate_token_id))
+        self._promotable_snapshots = (*self._promotable_snapshots, second_snapshot)
+        self._results = (self._first_result, result)
+        self.counters.transactions += 1
+        self.counters.candidate_tokens_executed += 2
+        return result
+
+    @property
+    def _first_result_token_id(self) -> int:
+        """Candidate A is retained independently of logits/result shape."""
+        if self._first_token_id is None:
+            raise RuntimeError("AsymSpec FULL candidate transaction was not begun.")
+        return self._first_token_id
 
     def execute_candidate(
         self, candidate_token_ids: tuple[int, int] | list[int]
     ) -> tuple[AsymSpecDraftForwardResult, AsymSpecDraftForwardResult]:
         """Execute a K=2 suffix, capture promotable GDN, restore canonical GDN."""
-        if self.active:
-            raise RuntimeError("AsymSpec FULL candidate transaction is already active.")
-        if not self.driver._prefilled:
-            raise RuntimeError("AsymSpec FULL must be prefetched before candidates.")
         tokens = tuple(int(token) for token in candidate_token_ids)
         if len(tokens) != 2:
             raise ValueError("AsymSpec FULL candidate transaction requires K=2 tokens.")
-        canonical_len = self.driver.canonical_len
-        canonical_snapshot = self._snapshot_gdn_pages()
-        results: list[AsymSpecDraftForwardResult] = []
-        promotable: list[tuple[_GDNPageSnapshot, ...]] = []
-        try:
-            for offset, token in enumerate(tokens):
-                start = canonical_len + offset
-                self.driver._ensure_attention_capacity(start + 1)
-                result = self.driver._forward(
-                    torch.tensor([token], dtype=torch.int32, device=self.driver.device),
-                    query_start=start,
-                    canonical_end=start,
-                    allow_uncommitted_start=True,
-                )
-                results.append(result)
-                promotable.append(self._snapshot_gdn_pages())
-        except Exception:
-            self._restore_gdn_pages(canonical_snapshot)
-            raise
-        self._restore_gdn_pages(canonical_snapshot)
-        self._canonical_len = canonical_len
-        self._candidate_token_ids = tokens
-        self._canonical_snapshot = canonical_snapshot
-        self._promotable_snapshots = tuple(promotable)
-        self._results = tuple(results)
-        self.counters.transactions += 1
-        self.counters.candidate_tokens_executed += 2
-        return self._results[0], self._results[1]
+        first = self.begin_candidate(tokens[0])
+        second = self.complete_candidate(tokens[1])
+        return first, second
 
     def rollback(self) -> None:
         """Discard the active suffix and retain the original canonical state."""
         if not self.active:
             raise RuntimeError("AsymSpec FULL candidate transaction is not active.")
+        if not self.ready_to_promote:
+            raise RuntimeError("AsymSpec FULL candidate transaction is incomplete.")
         self._restore_gdn_pages(self._canonical_snapshot)
         self.counters.rollbacks += 1
         self._clear()
@@ -165,5 +224,6 @@ class AsymSpecFullCandidateTransaction:
         self.driver.request_state.advance_full(accepted_tokens)
         self.counters.promoted_tokens += accepted_tokens
         result = self._results[accepted_tokens - 1]
+        self.driver._set_last_result(result)
         self._clear()
         return result
