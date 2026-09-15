@@ -39,6 +39,9 @@ from vllm.v1.spec_decode.asymspec.draft_forward import (
     execute_asymspec_draft_forward,
     qwen3_5_text_positions,
 )
+from vllm.v1.spec_decode.asymspec.draft_signal import (
+    build_asymspec_draft_signal,
+)
 from vllm.v1.spec_decode.asymspec.execution_metadata import (
     build_asymspec_view_execution_metadata,
     recurrent_page_ids,
@@ -148,6 +151,40 @@ def test_shared_state_leaves_runtime_attributes_tree_local():
     assert full.persistent is base.persistent
     assert full.kv_cache is not base.kv_cache
     assert full.runtime_state is not base.runtime_state
+
+
+def test_draft_signal_uses_fp32_subtraction_without_mutating_rows():
+    a0 = torch.tensor([1.0, 3.0], dtype=torch.bfloat16)
+    b0 = torch.tensor([0.5, 1.0], dtype=torch.bfloat16)
+    a1 = torch.tensor([2.0, -1.0], dtype=torch.bfloat16)
+    b1 = torch.tensor([1.5, -3.0], dtype=torch.bfloat16)
+    originals = tuple(row.clone() for row in (a0, b0, a1, b1))
+
+    signal = build_asymspec_draft_signal(
+        candidate_token_ids=(1, 0), a0=a0, b0=b0, a1=a1, b1=b1
+    )
+
+    assert signal.candidate_token_ids == (1, 0)
+    assert signal.d0.dtype is torch.float32
+    assert signal.d1.dtype is torch.float32
+    assert torch.equal(signal.d0, a0.float() - b0.float())
+    assert torch.equal(signal.d1, a1.float() - b1.float())
+    assert all(torch.equal(row, original)
+               for row, original in zip((a0, b0, a1, b1), originals))
+
+
+def test_draft_signal_rejects_mismatched_or_non_row_logits():
+    row = torch.zeros(4)
+    with pytest.raises(ValueError, match="shapes"):
+        build_asymspec_draft_signal(
+            candidate_token_ids=(1, 2), a0=row, b0=torch.zeros(3),
+            a1=row, b1=row,
+        )
+    with pytest.raises(ValueError, match="one-dimensional"):
+        build_asymspec_draft_signal(
+            candidate_token_ids=(1, 2), a0=row[None], b0=row[None],
+            a1=row[None], b1=row[None],
+        )
 
 
 def test_loads_one_checkpoint_model_then_builds_shared_storage_base(monkeypatch):

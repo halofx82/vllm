@@ -1436,6 +1436,183 @@ class Worker(WorkerBase):
             state.release()
         return {"rank": self.rank, "stress": stress, "deferred": deferred}
 
+    def run_asymspec_draft_signal_diagnostic(
+        self, cases: list[dict[str, object]], output_dir: str
+    ) -> dict[str, object]:
+        """Capture raw FULL/BASE K=2 rows without target participation.
+
+        This AsymSpec-only worker RPC is intentionally diagnostic.  It uses
+        the established proposer and BASE scorer, writes rank-zero vectors to
+        ``output_dir``, then rolls both disposable paths back.  It neither
+        invokes the scheduler nor introduces a draft-signal policy.
+        """
+        if self.vllm_config.speculative_config is None or (
+            self.vllm_config.speculative_config.method != "asymspec"
+        ):
+            raise RuntimeError(
+                "run_asymspec_draft_signal_diagnostic requires method='asymspec'."
+            )
+        from pathlib import Path
+
+        from vllm.v1.spec_decode.asymspec import (
+            AsymSpecBasePairScorer,
+            AsymSpecCanonicalDraftDriver,
+            AsymSpecFullK2Proposer,
+            AsymSpecViewRole,
+            allocate_asymspec_physical_cache_tensors,
+            bind_asymspec_draft_caches,
+            build_asymspec_domain_allocation_plans,
+            build_asymspec_draft_signal,
+            build_asymspec_logical_cache_plan,
+            build_asymspec_physical_cache_plan,
+            compose_asymspec_global_cache_plan,
+            create_asymspec_request_state,
+            instantiate_asymspec_logical_block_pools,
+        )
+
+        if not cases:
+            raise ValueError("AsymSpec draft signal diagnostic requires cases.")
+        normalized_cases: list[tuple[str, list[int], list[int]]] = []
+        for index, case in enumerate(cases):
+            case_id = str(case.get("id", f"case-{index:03d}"))
+            full_ids = [int(token) for token in case["full_prompt_token_ids"]]
+            base_ids = [int(token) for token in case["base_prompt_token_ids"]]
+            if not full_ids or not base_ids:
+                raise ValueError(f"{case_id}: prompts must be non-empty.")
+            normalized_cases.append((case_id, full_ids, base_ids))
+
+        import torch
+
+        runner = self.model_runner
+        views = getattr(runner, "asymspec_draft_views", None)
+        if views is None:
+            raise RuntimeError("AsymSpec draft views are not initialized.")
+        device = self.device
+        capacity = max(
+            max(len(full_ids), len(base_ids)) + 2
+            for _, full_ids, base_ids in normalized_cases
+        )
+        target_specs = runner.get_kv_cache_spec()
+        global_plan = compose_asymspec_global_cache_plan(
+            vllm_config=runner.vllm_config,
+            target_specs=target_specs,
+            full_plan=views.full.state.cache_plan,
+            base_plan=views.base.state.cache_plan,
+        )
+        domain_plans = build_asymspec_domain_allocation_plans(
+            global_plan=global_plan,
+            full_max_model_len=capacity,
+            compressed_max_model_len=capacity,
+        )
+        physical = allocate_asymspec_physical_cache_tensors(
+            plan=build_asymspec_physical_cache_plan(
+                global_plan=global_plan, domain_plans=domain_plans
+            ),
+            device=device,
+        )
+        logical = instantiate_asymspec_logical_block_pools(
+            build_asymspec_logical_cache_plan(physical.plan)
+        )
+        bindings = bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=physical,
+            global_plan=global_plan,
+            logical_pools=logical,
+            vllm_config=runner.vllm_config,
+        )
+        is_writer = self.rank == 0
+        out = Path(output_dir)
+        if is_writer:
+            out.mkdir(parents=True, exist_ok=True)
+
+        def row_summary(row: torch.Tensor, candidate: int) -> dict[str, object]:
+            values, indices = row.float().topk(10)
+            return {
+                "candidate_logit": float(row[int(candidate)].float().item()),
+                "top10_ids": [int(token) for token in indices.tolist()],
+                "top10_logits": [float(value) for value in values.tolist()],
+            }
+
+        records: list[dict[str, object]] = []
+        for index, (case_id, full_ids, base_ids) in enumerate(normalized_cases):
+            state = create_asymspec_request_state(
+                request_id=f"draft-signal-{index}-{case_id}",
+                compressed_prompt_len=len(base_ids),
+                full_prompt_len=len(full_ids),
+                augmentation_offset=len(full_ids) - len(base_ids),
+                logical_pools=logical,
+                canonical_prompt_processed=False,
+                device=device,
+            )
+            common = dict(
+                request_state=state,
+                views=views,
+                cache_bindings=bindings,
+                vllm_config=runner.vllm_config,
+                device=device,
+            )
+            full = AsymSpecCanonicalDraftDriver(
+                role=AsymSpecViewRole.FULL, **common
+            )
+            base = AsymSpecCanonicalDraftDriver(
+                role=AsymSpecViewRole.BASE, **common
+            )
+            full.prefill(torch.tensor(full_ids, dtype=torch.int32, device=device))
+            base.prefill(torch.tensor(base_ids, dtype=torch.int32, device=device))
+            full_len_before = state.full.canonical_len
+            base_len_before = state.base.canonical_len
+            proposal = AsymSpecFullK2Proposer(full).propose_k2()
+            score = AsymSpecBasePairScorer(base).score_pair(
+                proposal.candidate_token_ids
+            )
+            signal = build_asymspec_draft_signal(
+                candidate_token_ids=proposal.candidate_token_ids,
+                a0=proposal.canonical_result.logits[0],
+                b0=score.logits_before_a.logits[0],
+                a1=proposal.candidate_results[0].logits[0],
+                b1=score.logits_before_b.logits[0],
+            )
+            proposal.transaction.rollback()
+            state_ok = (
+                state.full.canonical_len == full_len_before
+                and state.base.canonical_len == base_len_before
+                and state.base.observed_len == base_len_before
+                and not state.base.pending_token_ids
+                and torch.equal(full.last_result.logits[0], signal.a0)
+                and torch.equal(base.last_result.logits[0], signal.b0)
+            )
+            record = {
+                "id": case_id,
+                "candidate_token_ids": list(signal.candidate_token_ids),
+                "full_len": full_len_before,
+                "base_len": base_len_before,
+                "state_restored": state_ok,
+                "historical_replay_tokens": 0,
+                "a0": row_summary(signal.a0, signal.candidate_token_ids[0]),
+                "b0": row_summary(signal.b0, signal.candidate_token_ids[0]),
+                "d0": row_summary(signal.d0, signal.candidate_token_ids[0]),
+                "a1": row_summary(signal.a1, signal.candidate_token_ids[1]),
+                "b1": row_summary(signal.b1, signal.candidate_token_ids[1]),
+                "d1": row_summary(signal.d1, signal.candidate_token_ids[1]),
+            }
+            if is_writer:
+                torch.save(
+                    {
+                        "id": case_id,
+                        "candidate_token_ids": signal.candidate_token_ids,
+                        "a0": signal.a0.cpu().to(torch.bfloat16),
+                        "b0": signal.b0.cpu().to(torch.bfloat16),
+                        "d0": signal.d0.cpu(),
+                        "a1": signal.a1.cpu().to(torch.bfloat16),
+                        "b1": signal.b1.cpu().to(torch.bfloat16),
+                        "d1": signal.d1.cpu(),
+                    },
+                    out / f"native-draft-signal-{index:03d}.pt",
+                )
+            records.append(record)
+            state.release()
+        return {"rank": self.rank, "records": records}
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine

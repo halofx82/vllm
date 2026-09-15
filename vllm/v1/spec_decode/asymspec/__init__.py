@@ -39,6 +39,7 @@ from .draft_forward import (
     initialize_fresh_asymspec_view_state,
     qwen3_5_text_positions,
 )
+from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
 from .execution_metadata import (
     AsymSpecMetadataGroup,
     AsymSpecViewExecutionMetadata,
@@ -91,6 +92,7 @@ __all__ = [
     "AsymSpecFullK2Proposal",
     "AsymSpecFullK2Proposer",
     "AsymSpecDraftForwardResult",
+    "AsymSpecDraftSignal",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",
     "AsymSpecDraftLoadMemory",
@@ -129,6 +131,7 @@ __all__ = [
     "build_asymspec_logical_cache_plan",
     "build_asymspec_physical_cache_plan",
     "build_asymspec_view_execution_metadata",
+    "build_asymspec_draft_signal",
     "instantiate_asymspec_logical_block_pools",
     "create_asymspec_request_state",
     "execute_asymspec_draft_forward",
