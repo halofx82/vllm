@@ -14,7 +14,6 @@ from dataclasses import dataclass
 import torch
 
 from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 
 from .cache_binding import AsymSpecDraftCacheBindingRuntime
 from .execution_metadata import AsymSpecViewExecutionMetadata
@@ -45,11 +44,12 @@ def initialize_fresh_asymspec_view_state(
     """Reset the active view's compact recurrent pages for a fresh request.
 
     The frozen compact ``MambaSpec`` path begins from zeroed committed and
-    speculative state pages.  Attention pages need no initialization because
-    the fresh request writes every token slot it subsequently reads.
+    speculative state pages.  Resetting the selected view's attention backing
+    storage as well makes a fresh canonical request independent of any prior
+    disposable use of that view; it never touches the inactive view.
     """
     for binding in cache_bindings.bindings.values():
-        if binding.role is role and isinstance(binding.module, MambaBase):
+        if binding.role is role:
             binding.raw_tensor.zero_()
 
 

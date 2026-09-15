@@ -7,6 +7,10 @@ from .cache_binding import (
     AsymSpecDraftCacheBindingRuntime,
     bind_asymspec_draft_caches,
 )
+from .canonical_driver import (
+    AsymSpecCanonicalDraftDriver,
+    AsymSpecCanonicalExecutionCounters,
+)
 from .cache_plan import (
     AsymSpecAllocatorCompatibility,
     AsymSpecCacheDomain,
@@ -65,6 +69,8 @@ from .views import (
 
 __all__ = [
     "AsymSpecDraftViews",
+    "AsymSpecCanonicalDraftDriver",
+    "AsymSpecCanonicalExecutionCounters",
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",

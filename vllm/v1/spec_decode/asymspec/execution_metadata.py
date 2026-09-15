@@ -242,6 +242,7 @@ def build_asymspec_view_execution_metadata(
     query_len: int,
     query_start: int | None = None,
     canonical_end: int | None = None,
+    allow_uncommitted_end: bool = False,
     device: torch.device | None = None,
 ) -> AsymSpecViewExecutionMetadata:
     """Build native role-specific metadata without executing a draft model.
@@ -256,6 +257,10 @@ def build_asymspec_view_execution_metadata(
         query_start: Optional role-local token coordinate; defaults to the
             role's current canonical boundary.
         canonical_end: GDN committed-state anchor; defaults to ``query_start``.
+        allow_uncommitted_end: Permit one canonical-driver forward that ends
+            beyond the committed boundary, provided its table capacity has
+            already been reserved.  The default preserves the existing
+            committed/catch-up validation semantics.
         device: Metadata tensor device; defaults to the view-model device.
     """
     if query_len <= 0:
@@ -271,7 +276,9 @@ def build_asymspec_view_execution_metadata(
     if query_start < 0 or canonical_end < 0:
         raise ValueError("AsymSpec metadata coordinates must be non-negative.")
     query_end = query_start + query_len
-    if query_end > _available_end_for_role(request_state, role):
+    if not allow_uncommitted_end and query_end > _available_end_for_role(
+        request_state, role
+    ):
         raise ValueError(
             f"{role.value} metadata reaches {query_end}, beyond its reserved "
             "canonical/observed request state."
@@ -297,6 +304,21 @@ def build_asymspec_view_execution_metadata(
         else AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
     )
     attention_table = tables.table_by_group[attention_group]
+    if allow_uncommitted_end:
+        if query_start != _coordinates_for_role(request_state, role):
+            raise ValueError(
+                "Uncommitted AsymSpec metadata must start at the role's "
+                "canonical boundary."
+            )
+        allocated_capacity = (
+            len(tables.allocated_blocks_by_group[attention_group])
+            * attention_table.block_size
+        )
+        if query_end > allocated_capacity:
+            raise ValueError(
+                "Uncommitted AsymSpec metadata exceeds reserved attention "
+                "table capacity."
+            )
     attention_block_ids, attention_slots = _attention_slots(
         table=attention_table, positions=positions
     )

@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm.v1.spec_decode.asymspec.canonical_driver as canonical_driver_module
 import vllm.v1.spec_decode.asymspec.execution_metadata as execution_metadata_module
 import vllm.v1.spec_decode.asymspec.views as views_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
@@ -26,6 +27,9 @@ from vllm.v1.spec_decode.asymspec.cache_plan import (
     build_asymspec_domain_allocation_plans,
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
+)
+from vllm.v1.spec_decode.asymspec.canonical_driver import (
+    AsymSpecCanonicalDraftDriver,
 )
 from vllm.v1.spec_decode.asymspec.draft_forward import (
     execute_asymspec_draft_forward,
@@ -349,6 +353,114 @@ def test_qwen3_5_text_positions_rejects_non_vector_coordinates():
     ]
     with pytest.raises(ValueError, match="one-dimensional"):
         qwen3_5_text_positions(torch.ones((1, 2), dtype=torch.int64))
+
+
+def _make_canonical_driver_test_state():
+    config, views, _, logical_runtime, bindings = _bind_metadata_test_runtime(
+        full_max_model_len=64,
+        compressed_max_model_len=32,
+    )
+    state = create_asymspec_request_state(
+        request_id="canonical-driver",
+        compressed_prompt_len=4,
+        full_prompt_len=4,
+        augmentation_offset=0,
+        canonical_prompt_processed=False,
+        logical_pools=logical_runtime,
+    )
+    return config, views, bindings, state
+
+
+def test_canonical_driver_commits_only_successful_role_local_forwards(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    built = []
+
+    def build_metadata(**kwargs):
+        built.append((kwargs["role"], kwargs["query_start"], kwargs["query_len"]))
+        return SimpleNamespace(role=kwargs["role"], query_len=kwargs["query_len"])
+
+    def execute(**kwargs):
+        return SimpleNamespace(role=kwargs["role"], logits=torch.tensor([[1.0]]))
+
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        build_metadata,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module, "execute_asymspec_draft_forward", execute
+    )
+
+    full = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    full.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    full.commit_token(5)
+    assert built[:2] == [(AsymSpecViewRole.FULL, 0, 4), (AsymSpecViewRole.FULL, 4, 1)]
+    assert state.full.canonical_len == 5
+    assert state.base.canonical_len == state.compressed.canonical_len == 0
+    assert full.counters.prefill_tokens_processed == 4
+    assert full.counters.incremental_tokens_processed == 1
+    assert full.counters.replayed_historical_tokens == 0
+
+    base = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.BASE,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    base.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    base.commit_token(torch.tensor(5, dtype=torch.int64))
+    assert built[2:] == [(AsymSpecViewRole.BASE, 0, 4), (AsymSpecViewRole.BASE, 4, 1)]
+    assert state.base.canonical_len == state.base.observed_len == 5
+    assert state.compressed.canonical_len == 0
+    assert state.full.canonical_len == 5
+    assert base.counters.replayed_historical_tokens == 0
+    state.release()
+
+
+def test_canonical_driver_does_not_advance_state_on_forward_failure(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_len=kwargs["query_len"]
+        ),
+    )
+
+    def fail(**kwargs):
+        raise RuntimeError("draft forward failed")
+
+    monkeypatch.setattr(canonical_driver_module, "execute_asymspec_draft_forward", fail)
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    with pytest.raises(RuntimeError, match="draft forward failed"):
+        driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    assert state.full.canonical_len == 0
+    assert driver.counters.total_forward_calls == 0
+    assert driver.counters.prefill_tokens_processed == 0
+    state.release()
 
 
 def _make_kv_spec_runner(config, views):

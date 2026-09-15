@@ -214,6 +214,26 @@ class AsymSpecRequestState:
         self.base.pending_token_ids.clear()
         return pending
 
+    def advance_base_committed(self, num_tokens: int) -> range:
+        """Advance BASE directly for ordinary non-deferred AR execution.
+
+        This is deliberately separate from :meth:`catch_up_base`: the
+        canonical driver exercises BASE independently before TARGET/deferred
+        execution is introduced.  TARGET's compressed canonical coordinate is
+        therefore left untouched, while ``observed_len`` records that BASE has
+        a locally executable prefix of this length.
+        """
+        if num_tokens < 0:
+            raise ValueError("BASE advancement must be non-negative.")
+        start = self.base.canonical_len
+        self.base.canonical_len += num_tokens
+        self.base.observed_len = max(self.base.observed_len, self.base.canonical_len)
+        self.block_tables.ensure_attention_tokens(
+            AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION,
+            self.base.canonical_len,
+        )
+        return range(start, self.base.canonical_len)
+
     def release(self) -> None:
         self.block_tables.release()
 
@@ -246,6 +266,7 @@ def create_asymspec_request_state(
     full_prompt_len: int,
     logical_pools: AsymSpecLogicalBlockPoolRuntime,
     augmentation_offset: int | None = None,
+    canonical_prompt_processed: bool = True,
     device: torch.device | None = None,
 ) -> AsymSpecRequestState:
     """Create pure AsymSpec request metadata and allocate its logical rows.
@@ -335,19 +356,21 @@ def create_asymspec_request_state(
                 logical_pools.pools[semantic_group].free_blocks(blocks)
         raise
 
+    initial_compressed_len = compressed_prompt_len if canonical_prompt_processed else 0
+    initial_full_len = full_prompt_len if canonical_prompt_processed else 0
     return AsymSpecRequestState(
         request_id=request_id,
         compressed=AsymSpecCompressedCoordinates(
-            prompt_len=compressed_prompt_len, canonical_len=compressed_prompt_len
+            prompt_len=compressed_prompt_len, canonical_len=initial_compressed_len
         ),
         base=AsymSpecBaseCoordinates(
             prompt_len=compressed_prompt_len,
-            canonical_len=compressed_prompt_len,
-            observed_len=compressed_prompt_len,
+            canonical_len=initial_compressed_len,
+            observed_len=initial_compressed_len,
         ),
         full=AsymSpecFullCoordinates(
             prompt_len=full_prompt_len,
-            canonical_len=full_prompt_len,
+            canonical_len=initial_full_len,
             augmentation_offset=augmentation_offset,
         ),
         block_tables=runtime,
