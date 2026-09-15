@@ -658,6 +658,128 @@ class Worker(WorkerBase):
         """
         self.model_runner.initialize_asymspec_cache_plans()
 
+    def run_asymspec_canonical_parity(
+        self, prompt_token_ids: list[int], reference_token_ids: list[int]
+    ) -> dict[str, object]:
+        """Run the allocation-local persistent parity diagnostic in a worker.
+
+        This is intentionally a narrow, AsymSpec-only RPC entry point.  It is
+        not part of request scheduling or normal generation.
+        """
+        if self.vllm_config.speculative_config is None or (
+            self.vllm_config.speculative_config.method != "asymspec"
+        ):
+            raise RuntimeError(
+                "run_asymspec_canonical_parity requires method='asymspec'."
+            )
+        import torch
+
+        from vllm.v1.spec_decode.asymspec import (
+            AsymSpecCanonicalDraftDriver,
+            AsymSpecViewRole,
+            allocate_asymspec_physical_cache_tensors,
+            bind_asymspec_draft_caches,
+            build_asymspec_domain_allocation_plans,
+            build_asymspec_logical_cache_plan,
+            build_asymspec_physical_cache_plan,
+            compose_asymspec_global_cache_plan,
+            create_asymspec_request_state,
+            instantiate_asymspec_logical_block_pools,
+        )
+
+        runner = self.model_runner
+        views = getattr(runner, "asymspec_draft_views", None)
+        if views is None:
+            raise RuntimeError("AsymSpec draft views are not initialized.")
+        device = self.device
+        prompt = torch.tensor(prompt_token_ids, dtype=torch.int32, device=device)
+        target_specs = runner.get_kv_cache_spec()
+        global_plan = compose_asymspec_global_cache_plan(
+            vllm_config=runner.vllm_config,
+            target_specs=target_specs,
+            full_plan=views.full.state.cache_plan,
+            base_plan=views.base.state.cache_plan,
+        )
+        domain_plans = build_asymspec_domain_allocation_plans(
+            global_plan=global_plan,
+            full_max_model_len=max(
+                len(prompt_token_ids) + len(reference_token_ids), 256
+            ),
+            compressed_max_model_len=max(
+                len(prompt_token_ids) + len(reference_token_ids), 256
+            ),
+        )
+        physical = allocate_asymspec_physical_cache_tensors(
+            plan=build_asymspec_physical_cache_plan(
+                global_plan=global_plan, domain_plans=domain_plans
+            ),
+            device=device,
+        )
+        logical = instantiate_asymspec_logical_block_pools(
+            build_asymspec_logical_cache_plan(physical.plan)
+        )
+        bindings = bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=physical,
+            global_plan=global_plan,
+            logical_pools=logical,
+            vllm_config=runner.vllm_config,
+        )
+
+        def run(role: AsymSpecViewRole) -> dict[str, object]:
+            state = create_asymspec_request_state(
+                request_id=f"canonical-{role.value}",
+                compressed_prompt_len=len(prompt_token_ids),
+                full_prompt_len=len(prompt_token_ids),
+                augmentation_offset=0,
+                logical_pools=logical,
+                canonical_prompt_processed=False,
+                device=device,
+            )
+            driver = AsymSpecCanonicalDraftDriver(
+                role=role,
+                request_state=state,
+                views=views,
+                cache_bindings=bindings,
+                vllm_config=runner.vllm_config,
+                device=device,
+            )
+            predictions = [int(driver.prefill(prompt).logits.argmax(-1).item())]
+            for token in reference_token_ids[:128]:
+                predictions.append(
+                    int(driver.commit_token(token).logits.argmax(-1).item())
+                )
+            expected = reference_token_ids[:129]
+            result = {
+                "role": role.value,
+                "predictions": predictions,
+                "expected": expected,
+                "matches": sum(a == b for a, b in zip(predictions, expected)),
+                "count": len(expected),
+                "first_mismatch": next(
+                    (
+                        i
+                        for i, (a, b) in enumerate(zip(predictions, expected))
+                        if a != b
+                    ),
+                    None,
+                ),
+                "state": {
+                    "full": state.full.canonical_len,
+                    "base": state.base.canonical_len,
+                    "compressed": state.compressed.canonical_len,
+                },
+                "counters": driver.counters.__dict__.copy(),
+            }
+            state.release()
+            return result
+
+        return {
+            "rank": self.rank,
+            "full": run(AsymSpecViewRole.FULL),
+            "base": run(AsymSpecViewRole.BASE),
+        }
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine

@@ -7,10 +7,6 @@ from .cache_binding import (
     AsymSpecDraftCacheBindingRuntime,
     bind_asymspec_draft_caches,
 )
-from .canonical_driver import (
-    AsymSpecCanonicalDraftDriver,
-    AsymSpecCanonicalExecutionCounters,
-)
 from .cache_plan import (
     AsymSpecAllocatorCompatibility,
     AsymSpecCacheDomain,
@@ -21,6 +17,12 @@ from .cache_plan import (
     AsymSpecDomainAllocationPlans,
     AsymSpecDomainGroupAllocationPlan,
     AsymSpecGlobalCachePlan,
+    build_asymspec_domain_allocation_plans,
+    compose_asymspec_global_cache_plan,
+)
+from .canonical_driver import (
+    AsymSpecCanonicalDraftDriver,
+    AsymSpecCanonicalExecutionCounters,
 )
 from .draft_forward import (
     AsymSpecDraftForwardResult,
@@ -85,6 +87,8 @@ __all__ = [
     "AsymSpecCacheNameRegistry",
     "AsymSpecCachePlan",
     "AsymSpecGlobalCachePlan",
+    "build_asymspec_domain_allocation_plans",
+    "compose_asymspec_global_cache_plan",
     "AsymSpecHybridStateSpec",
     "AsymSpecLogicalBlockPoolRuntime",
     "AsymSpecLogicalCacheGroup",
