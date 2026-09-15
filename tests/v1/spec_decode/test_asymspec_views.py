@@ -28,6 +28,9 @@ from vllm.v1.spec_decode.asymspec.cache_plan import (
     characterize_asymspec_allocator_compatibility,
     compose_asymspec_global_cache_plan,
 )
+from vllm.v1.spec_decode.asymspec.candidate_transaction import (
+    AsymSpecFullCandidateTransaction,
+)
 from vllm.v1.spec_decode.asymspec.canonical_driver import (
     AsymSpecCanonicalDraftDriver,
 )
@@ -159,7 +162,9 @@ def test_loads_one_checkpoint_model_then_builds_shared_storage_base(monkeypatch)
     monkeypatch.setattr(views_module, "get_model", load_once)
     monkeypatch.setattr(views_module, "initialize_model", lambda **_: base_model)
     monkeypatch.setattr(views_module, "set_model_tag", lambda _: nullcontext())
-    monkeypatch.setattr(views_module, "set_default_torch_dtype", lambda _: nullcontext())
+    monkeypatch.setattr(
+        views_module, "set_default_torch_dtype", lambda _: nullcontext()
+    )
 
     views.load_model()
 
@@ -463,6 +468,152 @@ def test_canonical_driver_does_not_advance_state_on_forward_failure(monkeypatch)
     state.release()
 
 
+def test_full_candidate_transaction_is_disposable_then_promotable(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    calls = []
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+
+    def build_metadata(**kwargs):
+        calls.append(
+            (
+                kwargs["query_start"],
+                kwargs["canonical_end"],
+                kwargs["allow_uncommitted_start"],
+            )
+        )
+        return SimpleNamespace(role=kwargs["role"], query_len=kwargs["query_len"])
+
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        build_metadata,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "execute_asymspec_draft_forward",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], logits=torch.tensor([[1.0]])
+        ),
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    transaction = AsymSpecFullCandidateTransaction(driver)
+    monkeypatch.setattr(transaction, "_snapshot_gdn_pages", lambda: ())
+    transaction.execute_candidate((5, 6))
+    assert state.full.canonical_len == 4
+    assert calls == [(0, 0, False), (4, 4, True), (5, 5, True)]
+    transaction.promote(1)
+    assert state.full.canonical_len == 5
+    assert transaction.counters.promoted_tokens == 1
+    assert not transaction.active
+    state.release()
+
+
+def test_full_candidate_transaction_rolls_back_and_rejects_double_begin(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_len=kwargs["query_len"]
+        ),
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "execute_asymspec_draft_forward",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], logits=torch.tensor([[1.0]])
+        ),
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    transaction = AsymSpecFullCandidateTransaction(driver)
+    monkeypatch.setattr(transaction, "_snapshot_gdn_pages", lambda: ())
+    transaction.execute_candidate((5, 6))
+    with pytest.raises(RuntimeError, match="already active"):
+        transaction.execute_candidate((5, 6))
+    transaction.rollback()
+    assert state.full.canonical_len == 4
+    assert transaction.counters.rollbacks == 1
+    transaction.execute_candidate((5, 6))
+    assert transaction.promote(0) is None
+    assert state.full.canonical_len == 4
+    assert transaction.counters.rollbacks == 2
+    with pytest.raises(RuntimeError, match="not active"):
+        transaction.rollback()
+    state.release()
+
+
+def test_full_candidate_transaction_restores_state_after_forward_exception(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_len=kwargs["query_len"]
+        ),
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "execute_asymspec_draft_forward",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], logits=torch.tensor([[1.0]])
+        ),
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.FULL,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    transaction = AsymSpecFullCandidateTransaction(driver)
+    snapshots = (SimpleNamespace(),)
+    restored = []
+    monkeypatch.setattr(transaction, "_snapshot_gdn_pages", lambda: snapshots)
+    monkeypatch.setattr(
+        transaction, "_restore_gdn_pages", lambda value: restored.append(value)
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "execute_asymspec_draft_forward",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("candidate forward failed")),
+    )
+    with pytest.raises(RuntimeError, match="candidate forward failed"):
+        transaction.execute_candidate((5, 6))
+    assert restored == [snapshots]
+    assert not transaction.active
+    assert state.full.canonical_len == 4
+    state.release()
+
+
 def test_deferred_base_observes_then_catches_up_once(monkeypatch):
     config, views, bindings, state = _make_canonical_driver_test_state()
     calls = []
@@ -577,9 +728,14 @@ def test_deferred_base_long_lag_crosses_attention_blocks():
     state.advance_target(list(range(900)))
     assert state.base.canonical_len == 800
     assert state.base.observed_len == state.compressed.canonical_len == 1700
-    assert len(state.block_tables.attention_block_ids(
-        AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
-    )) == 3
+    assert (
+        len(
+            state.block_tables.attention_block_ids(
+                AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION
+            )
+        )
+        == 3
+    )
     assert state.catch_up_base() == tuple(range(900))
     assert state.base.canonical_len == 1700
     assert state.base.pending_token_ids == []
@@ -628,7 +784,9 @@ def test_asymspec_target_cache_specs_exclude_draft_by_module_ownership(monkeypat
 
     assert len(target_specs) == 64
     assert all(name.startswith("target.") for name in target_specs)
-    assert sum(isinstance(spec, FullAttentionSpec) for spec in target_specs.values()) == 16
+    assert (
+        sum(isinstance(spec, FullAttentionSpec) for spec in target_specs.values()) == 16
+    )
     assert sum(isinstance(spec, MambaSpec) for spec in target_specs.values()) == 48
     assert all(
         not views.owns_physical_module(module)
@@ -1173,13 +1331,14 @@ def test_physical_cache_plan_is_one_independent_tensor_per_logical_layer():
         allocation.kv_cache_tensor.shared_by == [allocation.global_layer_name]
         for allocation in physical_plan.tensors
     )
-    assert {
-        allocation.domain for allocation in physical_plan.tensors
-    } == set(AsymSpecCacheDomain)
+    assert {allocation.domain for allocation in physical_plan.tensors} == set(
+        AsymSpecCacheDomain
+    )
     for domain in AsymSpecCacheDomain:
-        assert physical_plan.bytes_for_domain(domain) == getattr(
-            domain_plans, domain.value
-        ).minimum_bytes
+        assert (
+            physical_plan.bytes_for_domain(domain)
+            == getattr(domain_plans, domain.value).minimum_bytes
+        )
 
     full_attn = next(
         allocation
@@ -1305,17 +1464,13 @@ def test_logical_cache_plan_reproduces_eight_semantic_pool_topology():
     ]
     groups = {group.semantic_group: group for group in logical_plan.groups}
     assert (
-        len(groups[AsymSpecLogicalCacheGroup.TARGET_MAMBA_A].member_layer_names)
-        == 24
+        len(groups[AsymSpecLogicalCacheGroup.TARGET_MAMBA_A].member_layer_names) == 24
     )
     assert (
-        len(groups[AsymSpecLogicalCacheGroup.TARGET_MAMBA_B].member_layer_names)
-        == 24
+        len(groups[AsymSpecLogicalCacheGroup.TARGET_MAMBA_B].member_layer_names) == 24
     )
     assert (
-        len(
-            groups[AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION].member_layer_names
-        )
+        len(groups[AsymSpecLogicalCacheGroup.COMPRESSED_ATTENTION].member_layer_names)
         == 24
     )
     assert len(groups[AsymSpecLogicalCacheGroup.FULL_ATTENTION].member_layer_names) == 8
@@ -1699,6 +1854,7 @@ def test_execution_metadata_keeps_full_and_base_resources_role_local(monkeypatch
         name: tensor.untyped_storage().data_ptr()
         for name, tensor in physical_runtime.raw_tensors.items()
     }
+
     def fail_if_called(*args, **kwargs):
         raise AssertionError("metadata construction must not execute a draft model")
 

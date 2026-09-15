@@ -920,16 +920,18 @@ class Worker(WorkerBase):
                     result = driver.catch_up_base()
                     assert result is not None
                     prediction = int(result.logits.argmax(-1).item())
-                    checkpoints.append({
-                        "position": index,
-                        "prediction": prediction,
-                        "continuous_prediction": continuous_predictions[index],
-                        "matches": prediction == continuous_predictions[index],
-                        "canonical": state.base.canonical_len,
-                        "observed": state.base.observed_len,
-                        "pending": len(state.base.pending_token_ids),
-                        "fingerprint": fingerprint(AsymSpecViewRole.BASE),
-                    })
+                    checkpoints.append(
+                        {
+                            "position": index,
+                            "prediction": prediction,
+                            "continuous_prediction": continuous_predictions[index],
+                            "matches": prediction == continuous_predictions[index],
+                            "canonical": state.base.canonical_len,
+                            "observed": state.base.observed_len,
+                            "pending": len(state.base.pending_token_ids),
+                            "fingerprint": fingerprint(AsymSpecViewRole.BASE),
+                        }
+                    )
             final = checkpoints[-1]
             schedule_results[name] = {
                 "interval": interval,
@@ -949,6 +951,246 @@ class Worker(WorkerBase):
             "continuous": continuous_final,
             "schedules": schedule_results,
             "full_fingerprint_unchanged": full_before == full_after,
+        }
+
+    def run_asymspec_full_candidate_transaction_parity(
+        self, prompt_token_ids: list[int], reference_token_ids: list[int]
+    ) -> dict[str, object]:
+        """Exercise FULL-only K=2 rollback/promotion with supplied tokens.
+
+        Narrow AsymSpec diagnostic RPC only: there is no scheduler, BASE
+        execution, target execution, proposer, or verifier participation.
+        """
+        if self.vllm_config.speculative_config is None or (
+            self.vllm_config.speculative_config.method != "asymspec"
+        ):
+            raise RuntimeError(
+                "run_asymspec_full_candidate_transaction_parity requires "
+                "method='asymspec'."
+            )
+        import torch
+
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        from vllm.v1.spec_decode.asymspec import (
+            AsymSpecCanonicalDraftDriver,
+            AsymSpecFullCandidateTransaction,
+            AsymSpecViewRole,
+            allocate_asymspec_physical_cache_tensors,
+            bind_asymspec_draft_caches,
+            build_asymspec_domain_allocation_plans,
+            build_asymspec_logical_cache_plan,
+            build_asymspec_physical_cache_plan,
+            compose_asymspec_global_cache_plan,
+            create_asymspec_request_state,
+            instantiate_asymspec_logical_block_pools,
+        )
+
+        if len(reference_token_ids) < 128:
+            raise ValueError("FULL candidate transaction parity requires 128 tokens.")
+        runner = self.model_runner
+        views = getattr(runner, "asymspec_draft_views", None)
+        if views is None:
+            raise RuntimeError("AsymSpec draft views are not initialized.")
+        device = self.device
+        prompt = torch.tensor(prompt_token_ids, dtype=torch.int32, device=device)
+        tokens = [int(token) for token in reference_token_ids[:128]]
+        target_specs = runner.get_kv_cache_spec()
+        global_plan = compose_asymspec_global_cache_plan(
+            vllm_config=runner.vllm_config,
+            target_specs=target_specs,
+            full_plan=views.full.state.cache_plan,
+            base_plan=views.base.state.cache_plan,
+        )
+        domain_plans = build_asymspec_domain_allocation_plans(
+            global_plan=global_plan,
+            full_max_model_len=max(len(prompt_token_ids) + len(tokens), 256),
+            compressed_max_model_len=max(len(prompt_token_ids) + len(tokens), 256),
+        )
+        physical = allocate_asymspec_physical_cache_tensors(
+            plan=build_asymspec_physical_cache_plan(
+                global_plan=global_plan, domain_plans=domain_plans
+            ),
+            device=device,
+        )
+        logical = instantiate_asymspec_logical_block_pools(
+            build_asymspec_logical_cache_plan(physical.plan)
+        )
+        bindings = bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=physical,
+            global_plan=global_plan,
+            logical_pools=logical,
+            vllm_config=runner.vllm_config,
+        )
+
+        def fingerprint(role: AsymSpecViewRole) -> dict[str, tuple[float, ...]]:
+            representatives: dict[str, object] = {}
+            for binding in bindings.bindings.values():
+                if binding.role is role:
+                    kind = (
+                        "gdn" if isinstance(binding.module, MambaBase) else "attention"
+                    )
+                    representatives.setdefault(kind, binding)
+            result: dict[str, tuple[float, ...]] = {}
+            for kind, binding in representatives.items():
+                flat = binding.raw_tensor.reshape(-1)
+                stride = max(flat.numel() // 2048, 1)
+                sample = flat[::stride][:2048].to(torch.float32)
+                result[kind] = (
+                    float(sample.sum().item()),
+                    float(sample.abs().sum().item()),
+                    float(torch.count_nonzero(sample).item()),
+                )
+            return result
+
+        def make_driver(label: str) -> tuple[AsymSpecCanonicalDraftDriver, object]:
+            state = create_asymspec_request_state(
+                request_id=label,
+                compressed_prompt_len=len(prompt_token_ids),
+                full_prompt_len=len(prompt_token_ids),
+                augmentation_offset=0,
+                logical_pools=logical,
+                canonical_prompt_processed=False,
+                device=device,
+            )
+            return (
+                AsymSpecCanonicalDraftDriver(
+                    role=AsymSpecViewRole.FULL,
+                    request_state=state,
+                    views=views,
+                    cache_bindings=bindings,
+                    vllm_config=runner.vllm_config,
+                    device=device,
+                ),
+                state,
+            )
+
+        def canonical_run(
+            label: str, committed: list[int]
+        ) -> tuple[list[int], object, object]:
+            driver, state = make_driver(label)
+            predictions = [int(driver.prefill(prompt).logits.argmax(-1).item())]
+            for token in committed:
+                predictions.append(
+                    int(driver.commit_token(token).logits.argmax(-1).item())
+                )
+            return predictions, driver, state
+
+        base_before = fingerprint(AsymSpecViewRole.BASE)
+
+        def branch_case(name: str, accepted: int) -> dict[str, object]:
+            prefix = tokens[:4]
+            continuation = tokens[4 + accepted : 4 + accepted + 64]
+            control_predictions, control, control_state = canonical_run(
+                f"candidate-control-{name}",
+                prefix + tokens[4 : 4 + accepted] + continuation,
+            )
+            control_fingerprint = fingerprint(AsymSpecViewRole.FULL)
+            control_state.release()
+            driver, state = make_driver(f"candidate-{name}")
+            predictions = [int(driver.prefill(prompt).logits.argmax(-1).item())]
+            for token in prefix:
+                predictions.append(
+                    int(driver.commit_token(token).logits.argmax(-1).item())
+                )
+            transaction = AsymSpecFullCandidateTransaction(driver)
+            candidate_results = transaction.execute_candidate((tokens[4], tokens[5]))
+            transaction.promote(accepted)
+            for candidate_result in candidate_results[:accepted]:
+                predictions.append(int(candidate_result.logits.argmax(-1).item()))
+            for token in continuation:
+                predictions.append(
+                    int(driver.commit_token(token).logits.argmax(-1).item())
+                )
+            # Both histories are identical after the requested promotion.
+            expected = control_predictions
+            matches = sum(a == b for a, b in zip(predictions, expected))
+            result = {
+                "accepted": accepted,
+                "matches": matches,
+                "count": len(expected),
+                "continuation_matches": predictions[-64:] == expected[-64:],
+                "canonical": state.full.canonical_len,
+                "control_canonical": control_state.full.canonical_len,
+                "cache_fingerprint_matches_control": (
+                    fingerprint(AsymSpecViewRole.FULL) == control_fingerprint
+                ),
+                "transaction": transaction.counters.__dict__.copy(),
+                "driver": driver.counters.__dict__.copy(),
+            }
+            state.release()
+            return result
+
+        rollback = branch_case("rollback", 0)
+        promote_one = branch_case("promote-one", 1)
+        promote_two = branch_case("promote-two", 2)
+
+        # Fixed 0/1/2 pattern across 64 outer transactions. Candidate pairs
+        # are authoritative only where accepted; rollback pairs are arbitrary.
+        control_driver, control_state = make_driver("candidate-stress-control")
+        control_prediction = int(
+            control_driver.prefill(prompt).logits.argmax(-1).item()
+        )
+        consumed = 0
+        control_cycle_predictions = [control_prediction]
+        for cycle in range(64):
+            accepted = cycle % 3
+            for index in range(accepted):
+                control_result = control_driver.commit_token(tokens[consumed + index])
+                control_prediction = int(control_result.logits.argmax(-1).item())
+            control_cycle_predictions.append(control_prediction)
+            consumed += accepted
+        tail = tokens[consumed : consumed + 64]
+        control_tail_predictions: list[int] = []
+        for token in tail:
+            control_prediction = int(
+                control_driver.commit_token(token).logits.argmax(-1).item()
+            )
+            control_tail_predictions.append(control_prediction)
+        control_state.release()
+
+        stress_driver, stress_state = make_driver("candidate-stress")
+        stress_prediction = int(stress_driver.prefill(prompt).logits.argmax(-1).item())
+        transaction = AsymSpecFullCandidateTransaction(stress_driver)
+        stress_checks: list[bool] = [stress_prediction == control_cycle_predictions[0]]
+        consumed = 0
+        for cycle in range(64):
+            accepted = cycle % 3
+            transaction.execute_candidate((tokens[consumed], tokens[consumed + 1]))
+            promoted = transaction.promote(accepted)
+            if promoted is not None:
+                stress_prediction = int(promoted.logits.argmax(-1).item())
+            stress_checks.append(
+                stress_prediction == control_cycle_predictions[cycle + 1]
+            )
+            consumed += accepted
+        tail_checks: list[bool] = []
+        for token, expected in zip(tail, control_tail_predictions, strict=True):
+            stress_prediction = int(
+                stress_driver.commit_token(token).logits.argmax(-1).item()
+            )
+            tail_checks.append(stress_prediction == expected)
+        stress = {
+            "cycles": 64,
+            "accepted_tokens": consumed,
+            "cycle_matches": sum(stress_checks),
+            "cycle_count": len(stress_checks),
+            "tail_matches": sum(tail_checks),
+            "tail_count": len(tail_checks),
+            "canonical": stress_state.full.canonical_len,
+            "control_canonical": control_state.full.canonical_len,
+            "transaction": transaction.counters.__dict__.copy(),
+            "driver": stress_driver.counters.__dict__.copy(),
+        }
+        stress_state.release()
+        base_after = fingerprint(AsymSpecViewRole.BASE)
+        return {
+            "rank": self.rank,
+            "rollback": rollback,
+            "promote_one": promote_one,
+            "promote_two": promote_two,
+            "stress": stress,
+            "base_fingerprint_unchanged": base_before == base_after,
         }
 
     def update_max_model_len(self, max_model_len: int) -> None:

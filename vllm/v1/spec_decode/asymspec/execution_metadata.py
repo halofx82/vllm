@@ -243,6 +243,7 @@ def build_asymspec_view_execution_metadata(
     query_start: int | None = None,
     canonical_end: int | None = None,
     allow_uncommitted_end: bool = False,
+    allow_uncommitted_start: bool = False,
     device: torch.device | None = None,
 ) -> AsymSpecViewExecutionMetadata:
     """Build native role-specific metadata without executing a draft model.
@@ -261,6 +262,9 @@ def build_asymspec_view_execution_metadata(
             beyond the committed boundary, provided its table capacity has
             already been reserved.  The default preserves the existing
             committed/catch-up validation semantics.
+        allow_uncommitted_start: Permit a disposable candidate query to start
+            after the canonical boundary.  This is FULL-only transaction
+            metadata; it never advances request state.
         device: Metadata tensor device; defaults to the view-model device.
     """
     if query_len <= 0:
@@ -305,10 +309,14 @@ def build_asymspec_view_execution_metadata(
     )
     attention_table = tables.table_by_group[attention_group]
     if allow_uncommitted_end:
-        if query_start != _coordinates_for_role(request_state, role):
+        coordinate = _coordinates_for_role(request_state, role)
+        if (
+            query_start != coordinate
+            and not (allow_uncommitted_start and query_start >= coordinate)
+        ):
             raise ValueError(
                 "Uncommitted AsymSpec metadata must start at the role's "
-                "canonical boundary."
+                "canonical boundary unless it is a disposable candidate."
             )
         allocated_capacity = (
             len(tables.allocated_blocks_by_group[attention_group])

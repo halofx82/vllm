@@ -112,7 +112,12 @@ class AsymSpecCanonicalDraftDriver:
             self.request_state.advance_base_committed(num_tokens)
 
     def _forward(
-        self, input_ids: torch.Tensor, *, query_start: int
+        self,
+        input_ids: torch.Tensor,
+        *,
+        query_start: int,
+        canonical_end: int | None = None,
+        allow_uncommitted_start: bool = False,
     ) -> AsymSpecDraftForwardResult:
         metadata = build_asymspec_view_execution_metadata(
             request_state=self.request_state,
@@ -121,9 +126,10 @@ class AsymSpecCanonicalDraftDriver:
             vllm_config=self.vllm_config,
             role=self.role,
             query_start=query_start,
-            canonical_end=query_start,
+            canonical_end=(query_start if canonical_end is None else canonical_end),
             query_len=input_ids.numel(),
             allow_uncommitted_end=True,
+            allow_uncommitted_start=allow_uncommitted_start,
             device=self.device,
         )
         return execute_asymspec_draft_forward(

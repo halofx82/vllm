@@ -20,6 +20,10 @@ from .cache_plan import (
     build_asymspec_domain_allocation_plans,
     compose_asymspec_global_cache_plan,
 )
+from .candidate_transaction import (
+    AsymSpecCandidateTransactionCounters,
+    AsymSpecFullCandidateTransaction,
+)
 from .canonical_driver import (
     AsymSpecCanonicalDraftDriver,
     AsymSpecCanonicalExecutionCounters,
@@ -73,6 +77,8 @@ __all__ = [
     "AsymSpecDraftViews",
     "AsymSpecCanonicalDraftDriver",
     "AsymSpecCanonicalExecutionCounters",
+    "AsymSpecCandidateTransactionCounters",
+    "AsymSpecFullCandidateTransaction",
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",
