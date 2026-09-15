@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native AsymSpec components."""
 
+from .base_scorer import (
+    AsymSpecBasePairScore,
+    AsymSpecBasePairScorer,
+    AsymSpecBasePairScoringCounters,
+)
 from .cache_binding import (
     AsymSpecDraftCacheBinding,
     AsymSpecDraftCacheBindingRuntime,
@@ -76,6 +81,9 @@ from .views import (
 
 __all__ = [
     "AsymSpecDraftViews",
+    "AsymSpecBasePairScore",
+    "AsymSpecBasePairScorer",
+    "AsymSpecBasePairScoringCounters",
     "AsymSpecCanonicalDraftDriver",
     "AsymSpecCanonicalExecutionCounters",
     "AsymSpecCandidateTransactionCounters",

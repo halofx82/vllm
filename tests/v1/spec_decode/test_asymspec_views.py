@@ -19,6 +19,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.spec_decode.asymspec.base_scorer import AsymSpecBasePairScorer
 from vllm.v1.spec_decode.asymspec.cache_binding import (
     bind_asymspec_draft_caches,
 )
@@ -836,6 +837,107 @@ def test_deferred_base_long_lag_crosses_attention_blocks():
     )
     assert state.catch_up_base() == tuple(range(900))
     assert state.base.canonical_len == 1700
+    assert state.base.pending_token_ids == []
+    state.release()
+
+
+def test_base_pair_scorer_reuses_canonical_logits_and_restores_gdn(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_start=kwargs["query_start"]
+        ),
+    )
+    calls = []
+
+    def execute(**kwargs):
+        ids = kwargs["input_ids"].tolist()
+        calls.append((ids, kwargs["metadata"].query_start))
+        logits = [0.0] * 12
+        logits[7 if len(ids) > 1 else 9] = 1.0
+        return SimpleNamespace(role=kwargs["role"], logits=torch.tensor([logits]))
+
+    monkeypatch.setattr(
+        canonical_driver_module, "execute_asymspec_draft_forward", execute
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.BASE,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    scorer = AsymSpecBasePairScorer(driver)
+    snapshots = (SimpleNamespace(),)
+    restored = []
+    monkeypatch.setattr(scorer, "_snapshot_gdn_pages", lambda: snapshots)
+    monkeypatch.setattr(
+        scorer,
+        "_restore_gdn_pages",
+        lambda value: restored.append(value),
+    )
+    score = scorer.score_pair((7, 9))
+    assert calls == [([1, 2, 3, 4], 0), ([7], 4)]
+    assert score.candidate_token_ids == (7, 9)
+    assert float(score.score_a) == 1.0
+    assert float(score.score_b) == 1.0
+    assert score.candidate_scoring_forwards == 1
+    assert scorer.counters.candidate_tokens_executed == 1
+    assert state.base.canonical_len == 4
+    assert restored == [snapshots]
+    state.release()
+
+
+def test_base_pair_scorer_catches_up_before_disposable_candidate(monkeypatch):
+    config, views, bindings, state = _make_canonical_driver_test_state()
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "initialize_fresh_asymspec_view_state",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        canonical_driver_module,
+        "build_asymspec_view_execution_metadata",
+        lambda **kwargs: SimpleNamespace(
+            role=kwargs["role"], query_start=kwargs["query_start"]
+        ),
+    )
+    calls = []
+
+    def execute(**kwargs):
+        ids = kwargs["input_ids"].tolist()
+        calls.append((ids, kwargs["metadata"].query_start))
+        return SimpleNamespace(role=kwargs["role"], logits=torch.tensor([[1.0]]))
+
+    monkeypatch.setattr(
+        canonical_driver_module, "execute_asymspec_draft_forward", execute
+    )
+    driver = AsymSpecCanonicalDraftDriver(
+        role=AsymSpecViewRole.BASE,
+        request_state=state,
+        views=views,
+        cache_bindings=bindings,
+        vllm_config=config,
+    )
+    driver.prefill(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    driver.begin_deferred_base()
+    driver.observe_committed_token(5)
+    driver.observe_committed_token(6)
+    scorer = AsymSpecBasePairScorer(driver)
+    monkeypatch.setattr(scorer, "_snapshot_gdn_pages", lambda: ())
+    score = scorer.score_pair((0, 0))
+    assert calls == [([1, 2, 3, 4], 0), ([5, 6], 4), ([0], 6)]
+    assert score.catch_up_tokens == 2
+    assert scorer.counters.catch_up_tokens_processed == 2
+    assert state.base.canonical_len == state.base.observed_len == 6
     assert state.base.pending_token_ids == []
     state.release()
 

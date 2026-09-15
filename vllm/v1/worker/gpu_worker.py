@@ -1234,6 +1234,208 @@ class Worker(WorkerBase):
             "base_fingerprint_unchanged": base_before == base_after,
         }
 
+    def run_asymspec_base_pair_scoring_parity(
+        self, prompt_token_ids: list[int], reference_token_ids: list[int]
+    ) -> dict[str, object]:
+        """Score supplied FULL K=2 pairs through BASE without target work.
+
+        Narrow AsymSpec-only diagnostic RPC.  It deliberately bypasses the
+        scheduler and verifier while validating the production ordering:
+        catch up committed BASE work, retain position-zero logits, execute
+        only candidate A disposably, then restore BASE recurrent state.
+        """
+        if self.vllm_config.speculative_config is None or (
+            self.vllm_config.speculative_config.method != "asymspec"
+        ):
+            raise RuntimeError(
+                "run_asymspec_base_pair_scoring_parity requires method='asymspec'."
+            )
+        import torch
+
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        from vllm.v1.spec_decode.asymspec import (
+            AsymSpecBasePairScorer,
+            AsymSpecCanonicalDraftDriver,
+            AsymSpecFullK2Proposer,
+            AsymSpecViewRole,
+            allocate_asymspec_physical_cache_tensors,
+            bind_asymspec_draft_caches,
+            build_asymspec_domain_allocation_plans,
+            build_asymspec_logical_cache_plan,
+            build_asymspec_physical_cache_plan,
+            compose_asymspec_global_cache_plan,
+            create_asymspec_request_state,
+            instantiate_asymspec_logical_block_pools,
+        )
+
+        if len(reference_token_ids) < 128:
+            raise ValueError("BASE pair scoring parity requires 128 tokens.")
+        runner = self.model_runner
+        views = getattr(runner, "asymspec_draft_views", None)
+        if views is None:
+            raise RuntimeError("AsymSpec draft views are not initialized.")
+        device = self.device
+        prompt = torch.tensor(prompt_token_ids, dtype=torch.int32, device=device)
+        tokens = [int(token) for token in reference_token_ids[:128]]
+        target_specs = runner.get_kv_cache_spec()
+        global_plan = compose_asymspec_global_cache_plan(
+            vllm_config=runner.vllm_config,
+            target_specs=target_specs,
+            full_plan=views.full.state.cache_plan,
+            base_plan=views.base.state.cache_plan,
+        )
+        domain_plans = build_asymspec_domain_allocation_plans(
+            global_plan=global_plan,
+            full_max_model_len=max(len(prompt_token_ids) + len(tokens), 256),
+            compressed_max_model_len=max(len(prompt_token_ids) + len(tokens), 256),
+        )
+        physical = allocate_asymspec_physical_cache_tensors(
+            plan=build_asymspec_physical_cache_plan(
+                global_plan=global_plan, domain_plans=domain_plans
+            ),
+            device=device,
+        )
+        logical = instantiate_asymspec_logical_block_pools(
+            build_asymspec_logical_cache_plan(physical.plan)
+        )
+        bindings = bind_asymspec_draft_caches(
+            views=views,
+            physical_runtime=physical,
+            global_plan=global_plan,
+            logical_pools=logical,
+            vllm_config=runner.vllm_config,
+        )
+
+        def fingerprint(role: AsymSpecViewRole) -> dict[str, tuple[float, ...]]:
+            representatives: dict[str, object] = {}
+            for binding in bindings.bindings.values():
+                if binding.role is role:
+                    kind = (
+                        "gdn" if isinstance(binding.module, MambaBase) else "attention"
+                    )
+                    representatives.setdefault(kind, binding)
+            result: dict[str, tuple[float, ...]] = {}
+            for kind, binding in representatives.items():
+                flat = binding.raw_tensor.reshape(-1)
+                stride = max(flat.numel() // 2048, 1)
+                sample = flat[::stride][:2048].to(torch.float32)
+                result[kind] = (
+                    float(sample.sum().item()),
+                    float(sample.abs().sum().item()),
+                    float(torch.count_nonzero(sample).item()),
+                )
+            return result
+
+        def make_drivers(label: str):
+            state = create_asymspec_request_state(
+                request_id=label,
+                compressed_prompt_len=len(prompt_token_ids),
+                full_prompt_len=len(prompt_token_ids),
+                augmentation_offset=0,
+                logical_pools=logical,
+                canonical_prompt_processed=False,
+                device=device,
+            )
+            common = dict(
+                request_state=state,
+                views=views,
+                cache_bindings=bindings,
+                vllm_config=runner.vllm_config,
+                device=device,
+            )
+            return (
+                AsymSpecCanonicalDraftDriver(role=AsymSpecViewRole.FULL, **common),
+                AsymSpecCanonicalDraftDriver(role=AsymSpecViewRole.BASE, **common),
+                state,
+            )
+
+        full, base, state = make_drivers("base-score-stress")
+        full.prefill(prompt)
+        base.prefill(prompt)
+        scorer = AsymSpecBasePairScorer(base)
+        score_a_matches = []
+        score_b_matches = []
+        post_restore_matches = []
+        full_unchanged = []
+        max_b_logit_error = 0.0
+        for index in range(64):
+            proposal = AsymSpecFullK2Proposer(full).propose_k2()
+            full_before = fingerprint(AsymSpecViewRole.FULL)
+            before = base.last_result
+            score = scorer.score_pair(proposal.candidate_token_ids)
+            full_unchanged.append(full_before == fingerprint(AsymSpecViewRole.FULL))
+            score_a_matches.append(
+                int(before.logits.argmax(-1).item()) == tokens[index]
+                and torch.equal(score.logits_before_a.logits, before.logits)
+            )
+            # Canonically consuming A after restore is the independent BASE
+            # control for the disposable forward's B prediction.
+            canonical_after_a = base.commit_token(tokens[index])
+            score_b_matches.append(
+                int(score.logits_before_b.logits.argmax(-1).item())
+                == int(canonical_after_a.logits.argmax(-1).item())
+            )
+            max_b_logit_error = max(
+                max_b_logit_error,
+                float(
+                    (score.logits_before_b.logits.float()
+                    - canonical_after_a.logits.float()).abs().max().item()
+                ),
+            )
+            proposal.transaction.rollback()
+            full_after_a = full.commit_token(tokens[index])
+            post_restore_matches.append(
+                int(full_after_a.logits.argmax(-1).item())
+                == int(canonical_after_a.logits.argmax(-1).item())
+                == tokens[index + 1]
+            )
+        stress = {
+            "cycles": 64,
+            "score_a_matches": sum(score_a_matches),
+            "score_b_matches": sum(score_b_matches),
+            "post_restore_matches": sum(post_restore_matches),
+            "full_unchanged_during_base_scoring": all(full_unchanged),
+            "max_b_logit_error": max_b_logit_error,
+            "base_canonical": state.base.canonical_len,
+            "full_canonical": state.full.canonical_len,
+            "base_counters": base.counters.__dict__.copy(),
+            "scorer_counters": scorer.counters.__dict__.copy(),
+            "full_counters": full.counters.__dict__.copy(),
+        }
+        state.release()
+
+        deferred: dict[str, object] = {}
+        for lag in (2, 8, 32):
+            full, base, state = make_drivers(f"base-score-lag-{lag}")
+            full.prefill(prompt)
+            base.prefill(prompt)
+            base.begin_deferred_base()
+            for token in tokens[:lag]:
+                full.commit_token(token)
+                base.observe_committed_token(token)
+            proposal = AsymSpecFullK2Proposer(full).propose_k2()
+            scorer = AsymSpecBasePairScorer(base)
+            full_before = fingerprint(AsymSpecViewRole.FULL)
+            score = scorer.score_pair(proposal.candidate_token_ids)
+            canonical_after_a = base.commit_token(tokens[lag])
+            deferred[str(lag)] = {
+                "catch_up_tokens": score.catch_up_tokens,
+                "candidate_scoring_forwards": score.candidate_scoring_forwards,
+                "score_b_matches_canonical": int(
+                    score.logits_before_b.logits.argmax(-1).item()
+                )
+                == int(canonical_after_a.logits.argmax(-1).item()),
+                "base_canonical": state.base.canonical_len,
+                "base_observed": state.base.observed_len,
+                "pending": len(state.base.pending_token_ids),
+                "full_unchanged_during_base_scoring": full_before
+                == fingerprint(AsymSpecViewRole.FULL),
+                "scorer_counters": scorer.counters.__dict__.copy(),
+            }
+            proposal.transaction.rollback()
+            state.release()
+        return {"rank": self.rank, "stress": stress, "deferred": deferred}
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory.
         This is called when max_model_len=-1 is used and the engine
