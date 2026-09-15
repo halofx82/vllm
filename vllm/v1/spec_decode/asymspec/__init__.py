@@ -40,6 +40,7 @@ from .draft_forward import (
     qwen3_5_text_positions,
 )
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
+from .target_diagnostic import AsymSpecTargetRowCapture
 from .execution_metadata import (
     AsymSpecMetadataGroup,
     AsymSpecViewExecutionMetadata,
@@ -93,6 +94,7 @@ __all__ = [
     "AsymSpecFullK2Proposer",
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftSignal",
+    "AsymSpecTargetRowCapture",
     "AsymSpecDraftCacheBinding",
     "AsymSpecDraftCacheBindingRuntime",
     "AsymSpecDraftLoadMemory",
