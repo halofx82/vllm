@@ -4801,6 +4801,7 @@ class GPUModelRunner(
 
         sampler_output: SamplerOutput | None = None
         fixed_acceptance_outcome = None
+        asymspec_live_spec_token_ids: dict[str, tuple[int, int]] = {}
         if self.speculative_config is not None and (
             self.speculative_config.method == "asymspec"
         ):
@@ -4866,9 +4867,39 @@ class GPUModelRunner(
             active_live = getattr(self, "_asymspec_live_iterations", None)
             if active_live:
                 for request_id in scheduler_output.scheduled_spec_decode_tokens:
-                    runtime = active_live.pop(request_id, None)
+                    runtime = active_live.get(request_id)
                     if runtime is not None:
-                        runtime.rollback_and_release()
+                        if (
+                            fixed_acceptance_outcome is not None
+                            and fixed_acceptance_outcome.request_id == request_id
+                        ):
+                            # TARGET has selected its recurrent state and R
+                            # from the externally supplied diagnostic outcome.
+                            # Synchronize only the independent draft views;
+                            # V1 still owns all target bookkeeping below.
+                            asymspec_live_spec_token_ids[request_id] = (
+                                runtime.apply_target_outcome(
+                                    accepted_count=(
+                                        fixed_acceptance_outcome.accepted_count
+                                    ),
+                                    next_seed_token_id=(
+                                        fixed_acceptance_outcome.next_seed_token_id
+                                    ),
+                                )
+                            )
+                            if (not torch.distributed.is_initialized()
+                                    or torch.distributed.get_rank() == 0):
+                                runtime.append_outcome_capture(
+                                    accepted_count=(
+                                        fixed_acceptance_outcome.accepted_count
+                                    ),
+                                    next_seed_token_id=(
+                                        fixed_acceptance_outcome.next_seed_token_id
+                                    ),
+                                )
+                        else:
+                            active_live.pop(request_id)
+                            runtime.rollback_and_release()
 
             disposable_capture_request_ids = (
                 live_capture_request_ids | control_capture_request_ids
@@ -5071,7 +5102,6 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
-        asymspec_live_spec_token_ids: dict[str, tuple[int, int]] = {}
         if self.speculative_config is not None and (
             self.speculative_config.method == "asymspec"
         ):

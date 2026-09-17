@@ -102,6 +102,26 @@ def test_live_bridge_rejects_a_computed_or_missing_seed():
         )
 
 
+def test_live_bridge_arms_again_after_fixed_outcome_with_one_seed_left():
+    request = _request(
+        extra_args={
+            DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS: [1, 2],
+            DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS: [1, 2],
+            DIAGNOSTIC_LIVE_OUTPUT_PATH: "/tmp/live.pt",
+        }
+    )
+    # Prompt + accepted suffix + R; only R is intentionally uncomputed.
+    request._output_token_ids = [31, 13, 17, 41]
+    request.num_output_tokens = 4
+    request.num_prompt_tokens = 2
+    request.num_computed_tokens = 5
+
+    assert arm_asymspec_live_spec_tokens(
+        request, SimpleNamespace(method="asymspec"), (43, 47)
+    )
+    assert request.spec_token_ids == [43, 47]
+
+
 def test_target_control_arms_only_after_ordinary_seed_and_decode():
     request = _request(
         extra_args={

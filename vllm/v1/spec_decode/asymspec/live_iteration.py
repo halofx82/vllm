@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One diagnostic live AsymSpec seed-to-verifier iteration.
+"""Diagnostic live AsymSpec seed-to-verifier iterations.
 
-This deliberately stops before acceptance.  It turns the target sampler's
-ordinary, still-uncomputed output token into canonical FULL/BASE work, keeps
-the FULL K=2 transaction live, and returns only its pair to the V1 scheduler.
-The target remains entirely on the normal V1 path.
+It turns the target sampler's ordinary, still-uncomputed output token into
+canonical FULL/BASE work, keeps the FULL K=2 transaction live, and returns
+its pair to the V1 scheduler.  The test-only fixed-outcome path can then
+apply a supplied accepted count to the draft views after the target has
+selected its next seed.  TARGET itself remains entirely on the normal V1
+path.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,7 +57,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class AsymSpecLiveIterationRuntime:
-    """Draft state held only until the following disposable verifier forward."""
+    """Persistent draft state for one diagnostic live request."""
 
     request_id: str
     seed_token_id: int
@@ -70,6 +72,12 @@ class AsymSpecLiveIterationRuntime:
     signal: AsymSpecDraftSignal
     output_path: str
     base_lag_tokens: int = 0
+    authoritative_suffix_token_ids: list[int] = field(default_factory=list)
+    last_accepted_token_ids: tuple[int, ...] = ()
+    full_promoted_tokens: int = 0
+    full_rollbacks: int = 0
+    base_authoritative_tokens_observed: int = 0
+    base_catch_up_tokens: int = 0
 
     @property
     def candidate_token_ids(self) -> tuple[int, int]:
@@ -107,6 +115,98 @@ class AsymSpecLiveIterationRuntime:
         if self.proposal.transaction.active:
             self.proposal.transaction.rollback()
         self.request_state.release()
+
+    @torch.no_grad()
+    def apply_target_outcome(
+        self, *, accepted_count: int, next_seed_token_id: int
+    ) -> tuple[int, int]:
+        """Synchronize draft canonical state with one completed verifier.
+
+        The caller has already selected TARGET's recurrent state and native
+        bookkeeping will append the same accepted suffix plus ``next_seed``.
+        FULL promotes its own disposable K=2 state, while BASE deliberately
+        observes the authoritative suffix and catches up canonically; BASE's
+        candidate scoring state is never promotable.
+        """
+        if accepted_count not in (0, 1, 2):
+            raise ValueError("AsymSpec accepted count must be 0, 1, or 2.")
+        if not self.proposal.transaction.active:
+            raise RuntimeError("AsymSpec live FULL transaction is not active.")
+        if self.proposal.transaction.candidate_token_ids != self.candidate_token_ids:
+            raise RuntimeError("AsymSpec live FULL transaction pair mismatch.")
+
+        accepted = self.candidate_token_ids[:accepted_count]
+        self.proposal.transaction.promote(accepted_count)
+        self.full_promoted_tokens += accepted_count
+        self.full_rollbacks += int(accepted_count == 0)
+        self.full.commit_token(next_seed_token_id)
+
+        # BASE scores A only disposably.  Every accepted token and R therefore
+        # enters via the proven authoritative deferred queue before one packed
+        # canonical catch-up forward.
+        for token_id in (*accepted, int(next_seed_token_id)):
+            self.base.observe_committed_token(token_id)
+        self.base_authoritative_tokens_observed += len(accepted) + 1
+        self.base.catch_up_base()
+        self.base_catch_up_tokens += len(accepted) + 1
+        if self.request_state.base.pending_token_ids:
+            raise AssertionError("AsymSpec BASE pending queue survived outcome.")
+        expected_full_len = (
+            self.base.canonical_len
+            + self.request_state.full.augmentation_offset
+        )
+        if self.full.canonical_len != expected_full_len:
+            raise AssertionError(
+                "AsymSpec FULL/BASE canonical coordinates diverged."
+            )
+
+        self.proposal = AsymSpecFullK2Proposer(self.full).propose_k2()
+        self.base_score = AsymSpecBasePairScorer(self.base).score_pair(
+            self.proposal.candidate_token_ids
+        )
+        self.signal = build_asymspec_draft_signal(
+            candidate_token_ids=self.proposal.candidate_token_ids,
+            a0=self.proposal.canonical_result.logits[0],
+            b0=self.base_score.logits_before_a.logits[0],
+            a1=self.proposal.candidate_results[0].logits[0],
+            b1=self.base_score.logits_before_b.logits[0],
+        )
+        self.authoritative_suffix_token_ids.extend((*accepted, int(next_seed_token_id)))
+        self.last_accepted_token_ids = accepted
+        return self.candidate_token_ids
+
+    def append_outcome_capture(
+        self, *, accepted_count: int, next_seed_token_id: int
+    ) -> None:
+        """Persist compact post-transition facts for the live-chain harness."""
+        path = Path(self.output_path)
+        if not path.exists():
+            return
+        capture = torch.load(path, weights_only=False)
+        capture.setdefault("live_sync_rows", []).append({
+            "accepted_count": int(accepted_count),
+            "next_seed_token_id": int(next_seed_token_id),
+            "accepted_token_ids": list(self.last_accepted_token_ids),
+            "authoritative_suffix_token_ids": list(
+                self.authoritative_suffix_token_ids
+            ),
+            "full_canonical_len": self.full.canonical_len,
+            "base_canonical_len": self.base.canonical_len,
+            "base_observed_len": self.request_state.base.observed_len,
+            "base_pending_tokens": list(self.request_state.base.pending_token_ids),
+            "next_candidate_token_ids": list(self.candidate_token_ids),
+            "full_promoted_tokens": self.full_promoted_tokens,
+            "full_rollbacks": self.full_rollbacks,
+            "base_authoritative_tokens_observed": (
+                self.base_authoritative_tokens_observed
+            ),
+            "base_catch_up_tokens": self.base_catch_up_tokens,
+            "next_a0": self.signal.a0.detach().cpu().to(torch.bfloat16),
+            "next_b0": self.signal.b0.detach().cpu().to(torch.bfloat16),
+            "next_a1": self.signal.a1.detach().cpu().to(torch.bfloat16),
+            "next_b1": self.signal.b1.detach().cpu().to(torch.bfloat16),
+        })
+        torch.save(capture, path)
 
 
 def _live_prompt_ids(
@@ -243,6 +343,11 @@ def begin_asymspec_live_iteration(
         for token in preseed_ids:
             base.commit_token(token)
         base.commit_token(seed_token_id)
+    # All subsequent TARGET commits enter BASE through its authoritative
+    # deferred queue.  The initial prompt and seed above are already
+    # canonical in both compressed views.
+    if not base_lag:
+        base.begin_deferred_base()
     proposal = AsymSpecFullK2Proposer(full).propose_k2()
     base_score = AsymSpecBasePairScorer(base).score_pair(proposal.candidate_token_ids)
     signal = build_asymspec_draft_signal(
@@ -266,4 +371,5 @@ def begin_asymspec_live_iteration(
         signal=signal,
         output_path=output_path,
         base_lag_tokens=base_lag,
+        authoritative_suffix_token_ids=[*preseed_ids, int(seed_token_id)],
     )

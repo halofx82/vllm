@@ -162,13 +162,17 @@ def arm_asymspec_live_spec_tokens(
         raise ValueError("AsymSpec live diagnostic requires exactly two token IDs.")
     if request.spec_token_ids:
         raise RuntimeError("AsymSpec live diagnostic cannot overwrite spec tokens.")
-    if request.num_output_tokens != 1:
+    # Bootstrap has one output; later fixed-outcome rounds have an accepted
+    # suffix plus R.  In either case V1 must leave exactly that final seed
+    # canonical-but-uncomputed when the next pair is armed.
+    if request.num_output_tokens < 1:
+        raise RuntimeError("AsymSpec live diagnostic is missing its seed output.")
+    expected_computed = (
+        request.num_prompt_tokens + request.num_output_tokens - 1
+    )
+    if request.num_computed_tokens != expected_computed:
         raise RuntimeError(
-            "AsymSpec live diagnostic must arm immediately after one seed output."
-        )
-    if request.num_computed_tokens != request.num_prompt_tokens:
-        raise RuntimeError(
-            "AsymSpec live diagnostic seed must remain uncomputed at arming."
+            "AsymSpec live diagnostic must retain exactly one uncomputed seed."
         )
     request.spec_token_ids = tokens
     request._asymspec_live_seed_token_id = request._output_token_ids[-1]
