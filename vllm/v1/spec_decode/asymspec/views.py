@@ -8,9 +8,9 @@ one checkpoint-backed FULL draft tree plus a structurally independent BASE
 tree whose parameters and persistent buffers alias FULL storage.
 """
 
+from copy import copy
 from dataclasses import dataclass, field
 from enum import Enum
-from copy import copy
 from typing import TYPE_CHECKING
 
 import torch
@@ -139,6 +139,10 @@ class AsymSpecDraftViews:
         self.vllm_config = vllm_config
         self.device = device
         self.speculative_config = speculative_config
+        # Persist the role-local configuration used to construct the two
+        # Qwen3.5 module trees.  Metadata builders must retain its compact
+        # Mamba mode rather than inheriting TARGET's align mode.
+        self.draft_vllm_config: VllmConfig | None = None
         # ``model`` remains the FULL tree for existing draft-model accessors.
         self.model: nn.Module | None = None
         self.full: AsymSpecView | None = None
@@ -216,6 +220,7 @@ class AsymSpecDraftViews:
             raise RuntimeError("AsymSpec draft model has already been loaded.")
 
         draft_vllm_config = self._create_draft_vllm_config()
+        self.draft_vllm_config = draft_vllm_config
         before_full_load = self._allocated_memory()
         with set_model_tag("asymspec_draft"):
             model = get_model(
@@ -225,15 +230,18 @@ class AsymSpecDraftViews:
                 prefix="asymspec_draft",
             )
         after_full_load = self._allocated_memory()
-        with set_model_tag("asymspec_base"):
-            with set_default_torch_dtype(
-                    getattr(draft_vllm_config.model_config, "dtype", torch.bfloat16)):
-                with torch.device("meta"):
-                    base_model = initialize_model(
-                        vllm_config=draft_vllm_config,
-                        model_config=self.speculative_config.draft_model_config,
-                        prefix="asymspec_base",
-                    )
+        with (
+            set_model_tag("asymspec_base"),
+            set_default_torch_dtype(
+                getattr(draft_vllm_config.model_config, "dtype", torch.bfloat16)
+            ),
+            torch.device("meta"),
+        ):
+            base_model = initialize_model(
+                vllm_config=draft_vllm_config,
+                model_config=self.speculative_config.draft_model_config,
+                prefix="asymspec_base",
+            )
         after_base_tree = self._allocated_memory()
         self.bind_models(model, base_model)
         self.load_memory = AsymSpecDraftLoadMemory(

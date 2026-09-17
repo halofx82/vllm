@@ -49,6 +49,8 @@ from .verifier_bridge import (
 )
 from .views import AsymSpecViewRole
 
+ASYMSPEC_AUGMENTED_FULL_PROMPT_TOKEN_IDS = "specsteer_aug_prompt_ids"
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -327,50 +329,67 @@ def _live_prompt_ids(
     """Resolve production FULL/BASE coordinates for one target request.
 
     Frozen SCALE1 uses the native compressed prompt for both views in direct
-    engine mode. A server-owned augmented prompt can override that fallback;
-    the existing extra-arg form remains available solely for diagnostics and
-    future serving-side context construction.
+    engine mode. Its OpenAI server owns ``specsteer_aug_prompt_ids`` and
+    attaches it to the sampling request after rendering the complete chat
+    prompt.  Diagnostic overrides retain their separate schema.
     """
     params = request.sampling_params
     extra_args = None if params is None else params.extra_args
-    if not extra_args or DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS not in extra_args:
-        prompt_ids = request.prompt_token_ids
-        if not prompt_ids:
+    if extra_args and DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS in extra_args:
+        required = (
+            DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
+            DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
+            DIAGNOSTIC_LIVE_OUTPUT_PATH,
+        )
+        if any(key not in extra_args for key in required):
             raise ValueError(
-                "AsymSpec production requires token-ID prompts; prompt embeds "
-                "do not define a draft token coordinate system."
+                "AsymSpec live diagnostic is missing prompt/output metadata."
             )
-        ids = [int(token) for token in prompt_ids]
-        return ids, ids.copy(), [], "", 0
-    required = (
-        DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
-        DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
-        DIAGNOSTIC_LIVE_OUTPUT_PATH,
-    )
-    if any(key not in extra_args for key in required):
-        raise ValueError("AsymSpec live diagnostic is missing prompt/output metadata.")
-    full = extra_args[DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS]
-    base = extra_args[DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS]
-    if not isinstance(full, (list, tuple)) or not isinstance(base, (list, tuple)):
-        raise ValueError("AsymSpec live diagnostic prompts must be token-ID lists.")
-    full_ids = [int(token) for token in full]
-    base_ids = [int(token) for token in base]
-    if not full_ids or not base_ids:
-        raise ValueError("AsymSpec live diagnostic prompts must be non-empty.")
-    lag = int(extra_args.get(DIAGNOSTIC_LIVE_BASE_LAG_TOKENS, 0))
-    preseed = extra_args.get(DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS, ())
-    if not isinstance(preseed, (list, tuple)):
-        raise ValueError("AsymSpec live pre-seed commits must be token IDs.")
-    preseed_ids = [int(token) for token in preseed]
-    if lag < 0 or lag > len(preseed_ids):
-        raise ValueError("AsymSpec live BASE lag must be within pre-seed commits.")
-    return (
-        full_ids,
-        base_ids,
-        preseed_ids,
-        str(extra_args[DIAGNOSTIC_LIVE_OUTPUT_PATH]),
-        lag,
-    )
+        full = extra_args[DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS]
+        base = extra_args[DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS]
+        if not isinstance(full, (list, tuple)) or not isinstance(base, (list, tuple)):
+            raise ValueError("AsymSpec live diagnostic prompts must be token-ID lists.")
+        full_ids = [int(token) for token in full]
+        base_ids = [int(token) for token in base]
+        if not full_ids or not base_ids:
+            raise ValueError("AsymSpec live diagnostic prompts must be non-empty.")
+        lag = int(extra_args.get(DIAGNOSTIC_LIVE_BASE_LAG_TOKENS, 0))
+        preseed = extra_args.get(DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS, ())
+        if not isinstance(preseed, (list, tuple)):
+            raise ValueError("AsymSpec live pre-seed commits must be token IDs.")
+        preseed_ids = [int(token) for token in preseed]
+        if lag < 0 or lag > len(preseed_ids):
+            raise ValueError("AsymSpec live BASE lag must be within pre-seed commits.")
+        return (
+            full_ids,
+            base_ids,
+            preseed_ids,
+            str(extra_args[DIAGNOSTIC_LIVE_OUTPUT_PATH]),
+            lag,
+        )
+    prompt_ids = request.prompt_token_ids
+    if not prompt_ids:
+        raise ValueError(
+            "AsymSpec production requires token-ID prompts; prompt embeds "
+            "do not define a draft token coordinate system."
+        )
+    compressed_ids = [int(token) for token in prompt_ids]
+    if extra_args and ASYMSPEC_AUGMENTED_FULL_PROMPT_TOKEN_IDS in extra_args:
+        full = extra_args[ASYMSPEC_AUGMENTED_FULL_PROMPT_TOKEN_IDS]
+        if not isinstance(full, (list, tuple)) or not full:
+            raise ValueError(
+                "AsymSpec server full prompt must be a non-empty token-ID list."
+            )
+        full_ids = [int(token) for token in full]
+        if len(full_ids) < len(compressed_ids):
+            raise ValueError(
+                "AsymSpec full prompt cannot be shorter than compressed prompt."
+            )
+        # Capturing remains an optional diagnostic overlay; it does not alter
+        # the server-owned production coordinate contract.
+        output_path = str(extra_args.get(DIAGNOSTIC_LIVE_OUTPUT_PATH, ""))
+        return full_ids, compressed_ids, [], output_path, 0
+    return compressed_ids, compressed_ids.copy(), [], "", 0
 
 
 @torch.no_grad()
@@ -391,18 +410,20 @@ def begin_asymspec_live_iteration(
     views = getattr(runner, "asymspec_draft_views", None)
     if views is None:
         raise RuntimeError("AsymSpec live request requires initialized draft views.")
-    required_capacity = max(len(full_ids), len(base_ids)) + len(preseed_ids) + 3
+    full_capacity = views.full.state.cache_plan.max_model_len
+    base_capacity = views.base.state.cache_plan.max_model_len
+    required_full_capacity = len(full_ids) + len(preseed_ids) + 3
+    required_base_capacity = len(base_ids) + len(preseed_ids) + 3
+    if (
+        required_full_capacity > full_capacity
+        or required_base_capacity > base_capacity
+    ):
+        raise ValueError("AsymSpec live request prompt exceeds configured draft cache.")
     foundation = getattr(runner, "_asymspec_live_foundation", None)
     if foundation is None:
         # Draft module bindings are deliberately permanent.  Unlike the old
         # per-RPC diagnostics, a live V1 iteration must retain that one
         # binding set across requests instead of rebinding the module trees.
-        full_capacity = views.full.state.cache_plan.max_model_len
-        base_capacity = views.base.state.cache_plan.max_model_len
-        if required_capacity > full_capacity or required_capacity > base_capacity:
-            raise ValueError(
-                "AsymSpec live request prompt exceeds configured draft cache."
-            )
         target_specs = runner.get_kv_cache_spec()
         global_plan: AsymSpecGlobalCachePlan = compose_asymspec_global_cache_plan(
             vllm_config=runner.vllm_config,

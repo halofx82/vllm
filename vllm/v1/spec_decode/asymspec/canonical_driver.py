@@ -132,6 +132,7 @@ class AsymSpecCanonicalDraftDriver:
         *,
         query_start: int,
         canonical_end: int | None = None,
+        initial_prefill: bool = False,
         allow_uncommitted_start: bool = False,
     ) -> AsymSpecDraftForwardResult:
         metadata = build_asymspec_view_execution_metadata(
@@ -145,6 +146,7 @@ class AsymSpecCanonicalDraftDriver:
             query_len=input_ids.numel(),
             allow_uncommitted_end=True,
             allow_uncommitted_start=allow_uncommitted_start,
+            initial_prefill=initial_prefill,
             device=self.device,
         )
         return execute_asymspec_draft_forward(
@@ -156,7 +158,7 @@ class AsymSpecCanonicalDraftDriver:
         )
 
     def prefill(self, prompt_token_ids: torch.Tensor) -> AsymSpecDraftForwardResult:
-        """Run one fresh prompt prefill and commit it only after success."""
+        """Run a fresh prompt prefill, chunking only the long FULL view."""
         if self._prefilled:
             raise RuntimeError("AsymSpec canonical view is already prefilled.")
         if prompt_token_ids.ndim != 1 or prompt_token_ids.numel() <= 0:
@@ -174,12 +176,28 @@ class AsymSpecCanonicalDraftDriver:
         initialize_fresh_asymspec_view_state(
             role=self.role, cache_bindings=self.cache_bindings
         )
-        result = self._forward(prompt_token_ids, query_start=0)
-        self._advance(prompt_token_ids.numel())
+        chunk_size = prompt_token_ids.numel()
+        speculative_config = self.vllm_config.speculative_config
+        if self.role is AsymSpecViewRole.FULL and speculative_config is not None:
+            chunk_size = getattr(
+                speculative_config,
+                "asymspec_full_prefill_chunk_tokens",
+                chunk_size,
+            )
+        result: AsymSpecDraftForwardResult | None = None
+        for start in range(0, prompt_token_ids.numel(), chunk_size):
+            token_ids = prompt_token_ids[start : start + chunk_size]
+            result = self._forward(
+                token_ids,
+                query_start=start,
+                initial_prefill=(start == 0),
+            )
+            self._advance(token_ids.numel())
+            self.counters.prefill_forward_calls += 1
+            self.counters.prefill_tokens_processed += token_ids.numel()
+        assert result is not None
         self._set_last_result(result)
         self._prefilled = True
-        self.counters.prefill_forward_calls += 1
-        self.counters.prefill_tokens_processed += prompt_token_ids.numel()
         return result
 
     def commit_token(self, token_id: int | torch.Tensor) -> AsymSpecDraftForwardResult:

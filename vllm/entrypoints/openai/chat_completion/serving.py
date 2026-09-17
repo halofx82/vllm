@@ -5,6 +5,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Final, cast
 
@@ -22,6 +23,13 @@ from vllm.entrypoints.generate.base.serving import (
     build_per_request_timing_metrics,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
+)
+from vllm.entrypoints.openai.chat_completion.asymspec_serving import (
+    RESERVED_EXTRA_ARG,
+    AsymSpecContextError,
+    has_reserved_extra_arg,
+    is_text_only,
+    split_recent_turns,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
@@ -65,6 +73,16 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _AsymSpecChatInputs:
+    """The full and compressed renderer outputs for one chat request."""
+
+    conversation: list[ConversationMessage]
+    engine_input: EngineInput
+    full_prompt_token_ids: list[int]
+    max_tokens: int
 
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
@@ -167,6 +185,13 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        self._speculative_config = getattr(
+            engine_client.vllm_config, "speculative_config", None
+        )
+        self._asymspec_enabled = (
+            self._speculative_config is not None
+            and self._speculative_config.method == "asymspec"
+        )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -222,6 +247,129 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
+    async def _render_asymspec_chat_request(
+        self, request: ChatCompletionRequest
+    ) -> _AsymSpecChatInputs | ErrorResponse:
+        """Render frozen SCALE1's full and compressed request views.
+
+        The target engine receives the compressed recent-turn prompt.  The
+        complete renderer-produced token stream is attached below as a
+        server-owned argument used only by the FULL draft runtime.
+        """
+        assert self._speculative_config is not None
+        if has_reserved_extra_arg(request.vllm_xargs):
+            return self.online_renderer.create_error_response(
+                f"{RESERVED_EXTRA_ARG} is managed by the AsymSpec server"
+            )
+        if request.truncate_prompt_tokens is not None:
+            return self.online_renderer.create_error_response(
+                "truncate_prompt_tokens is unsupported for AsymSpec chat "
+                "requests because both prompt views must remain complete"
+            )
+        if not is_text_only(request.messages):
+            return self.online_renderer.create_error_response(
+                "multimodal Chat Completions are not yet supported by "
+                "AsymSpec serving"
+            )
+
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        full_result = await self.online_renderer.render_chat(request)
+        if isinstance(full_result, ErrorResponse):
+            return full_result
+        conversation, full_engine_inputs = full_result
+        if len(full_engine_inputs) != 1:
+            return self.online_renderer.create_error_response(
+                "AsymSpec serving requires exactly one rendered chat prompt"
+            )
+        full_prompt_token_ids = list(
+            self._extract_prompt_components(full_engine_inputs[0]).token_ids or []
+        )
+        try:
+            max_tokens = get_max_tokens(
+                self.model_config.max_model_len,
+                request.max_completion_tokens
+                if request.max_completion_tokens is not None
+                else request.max_tokens,
+                len(full_prompt_token_ids),
+                self.default_sampling_params,
+                self.override_max_tokens,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
+            )
+        except ValueError as exc:
+            return self.online_renderer.create_error_response(exc)
+
+        num_speculative_tokens = self._speculative_config.num_speculative_tokens
+        assert num_speculative_tokens is not None
+        if (
+            len(full_prompt_token_ids) + max_tokens + num_speculative_tokens
+            > self.model_config.max_model_len
+        ):
+            return self.online_renderer.create_error_response(
+                "The full AsymSpec prompt plus requested completion and "
+                "speculative-token headroom exceeds max_model_len "
+                f"({self.model_config.max_model_len})"
+            )
+
+        main_limit = self._speculative_config.asymspec_compressed_max_model_len
+        assert main_limit is not None
+        main_prompt_budget = main_limit - max_tokens - num_speculative_tokens
+        if main_prompt_budget <= 0:
+            return self.online_renderer.create_error_response(
+                "asymspec_compressed_max_model_len leaves no room for the "
+                "requested completion and speculative-token headroom"
+            )
+        try:
+            pinned, turns = split_recent_turns(request.messages)
+        except AsymSpecContextError as exc:
+            return self.online_renderer.create_error_response(exc)
+
+        compressed_input: EngineInput | None = None
+        for start in range(len(turns) - 1, -1, -1):
+            compressed_messages = pinned + [
+                message for turn in turns[start:] for message in turn
+            ]
+            compressed_request = request.model_copy(
+                deep=True, update={"messages": compressed_messages}
+            )
+            compressed_result = await self.online_renderer.render_chat(
+                compressed_request
+            )
+            if isinstance(compressed_result, ErrorResponse):
+                return compressed_result
+            _, compressed_inputs = compressed_result
+            if len(compressed_inputs) != 1:
+                return self.online_renderer.create_error_response(
+                    "AsymSpec serving requires exactly one rendered compressed prompt"
+                )
+            candidate = compressed_inputs[0]
+            if self._extract_prompt_len(candidate) <= main_prompt_budget:
+                compressed_input = candidate
+                continue
+            break
+        if compressed_input is None:
+            return self.online_renderer.create_error_response(
+                "Pinned instructions plus the newest user interaction exceed "
+                "the AsymSpec compressed-context capacity"
+            )
+        logger.info(
+            "AsymSpec request: full=%d compressed=%d max_new=%d K=%d strategy=recent",
+            len(full_prompt_token_ids),
+            self._extract_prompt_len(compressed_input),
+            max_tokens,
+            num_speculative_tokens,
+        )
+        return _AsymSpecChatInputs(
+            conversation=conversation,
+            engine_input=compressed_input,
+            full_prompt_token_ids=full_prompt_token_ids,
+            max_tokens=max_tokens,
+        )
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -255,7 +403,18 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
-        result = await self.render_chat_request(request)
+        asymspec_inputs: _AsymSpecChatInputs | None = None
+        if self._asymspec_enabled:
+            asymspec_result = await self._render_asymspec_chat_request(request)
+            if isinstance(asymspec_result, ErrorResponse):
+                return asymspec_result
+            asymspec_inputs = asymspec_result
+            result: tuple[list[ConversationMessage], list[EngineInput]] = (
+                asymspec_inputs.conversation,
+                [asymspec_inputs.engine_input],
+            )
+        else:
+            result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
@@ -290,15 +449,19 @@ class OpenAIServingChat(GenerateBaseServing):
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
 
-            max_tokens = get_max_tokens(
-                max_model_len,
-                request.max_completion_tokens
-                if request.max_completion_tokens is not None
-                else request.max_tokens,
-                self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
-                self.override_max_tokens,
-                truncate_prompt_tokens=request.truncate_prompt_tokens,
+            max_tokens = (
+                asymspec_inputs.max_tokens
+                if asymspec_inputs is not None
+                else get_max_tokens(
+                    max_model_len,
+                    request.max_completion_tokens
+                    if request.max_completion_tokens is not None
+                    else request.max_tokens,
+                    self._extract_prompt_len(engine_input),
+                    self.default_sampling_params,
+                    self.override_max_tokens,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
+                )
             )
 
             sampling_params: SamplingParams | BeamSearchParams
@@ -311,6 +474,16 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                if asymspec_inputs is not None:
+                    # The full view is server-owned: client xargs cannot
+                    # override it, and TARGET/BASE continue to see only the
+                    # compressed ``engine_input`` above.
+                    sampling_params.extra_args = dict(
+                        sampling_params.extra_args or {}
+                    )
+                    sampling_params.extra_args[RESERVED_EXTRA_ARG] = (
+                        asymspec_inputs.full_prompt_token_ids
+                    )
 
             self._log_inputs(
                 sub_request_id,

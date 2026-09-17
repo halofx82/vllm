@@ -9,11 +9,12 @@ trees, using the role-owned request tables established by ``request_state``.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionMetadata, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -189,6 +190,7 @@ def _build_group_metadata(
     query_start: int,
     query_end: int,
     canonical_end: int,
+    initial_prefill: bool,
     physical_layer_names: tuple[str, ...],
     forward_context_layer_names: tuple[str, ...],
     modules: dict[str, AttentionLayerBase],
@@ -203,7 +205,10 @@ def _build_group_metadata(
         query_end=query_end,
         slots=slots,
     )
-    if isinstance(spec, MambaSpec):
+    # Initial canonical prefill has no pre-existing recurrent state to anchor.
+    # Frozen SCALE1 intentionally leaves this unset for the first FULL chunk;
+    # subsequent chunks use their committed start coordinate.
+    if isinstance(spec, MambaSpec) and not initial_prefill:
         anchor = torch.tensor(
             [canonical_end], dtype=torch.int32, device=positions.device
         )
@@ -244,6 +249,7 @@ def build_asymspec_view_execution_metadata(
     canonical_end: int | None = None,
     allow_uncommitted_end: bool = False,
     allow_uncommitted_start: bool = False,
+    initial_prefill: bool = False,
     device: torch.device | None = None,
 ) -> AsymSpecViewExecutionMetadata:
     """Build native role-specific metadata without executing a draft model.
@@ -299,6 +305,20 @@ def build_asymspec_view_execution_metadata(
     }
     forward_context_names = _resolve_forward_context_names(
         vllm_config=vllm_config, modules=modules
+    )
+    # FULL/BASE use compact Mamba state; TARGET alone owns the align mode.
+    # The draft model trees were constructed with this config, and their
+    # native metadata builders must see the same cache-mode contract.
+    draft_vllm_config = getattr(views, "draft_vllm_config", None)
+    if draft_vllm_config is None:
+        draft_vllm_config = vllm_config
+    # Metadata builders consult ``cache_config.mamba_cache_mode`` in addition
+    # to their supplied MambaSpec.  Isolate it from TARGET's align mode even
+    # when a caller has subsequently normalized the parent config in-place.
+    draft_cache_config = copy(draft_vllm_config.cache_config)
+    draft_cache_config.mamba_cache_mode = "none"
+    draft_vllm_config = replace(
+        draft_vllm_config, cache_config=draft_cache_config
     )
     positions = torch.arange(query_start, query_end, dtype=torch.int64, device=device)
     tables = request_state.block_tables
@@ -384,6 +404,7 @@ def build_asymspec_view_execution_metadata(
             query_start=query_start,
             query_end=query_end,
             canonical_end=canonical_end,
+            initial_prefill=initial_prefill,
             physical_layer_names=physical_names,
             forward_context_layer_names=tuple(
                 forward_context_names[physical_name] for physical_name in physical_names
@@ -391,7 +412,7 @@ def build_asymspec_view_execution_metadata(
             modules=modules,
             spec=specs[0],
             recurrent_slots=tables.recurrent_slots.get(semantic_group),
-            vllm_config=vllm_config,
+            vllm_config=draft_vllm_config,
         )
         groups[semantic_group] = metadata_group
         for layer_name in metadata_group.forward_context_layer_names:

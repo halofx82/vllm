@@ -290,6 +290,33 @@ def test_live_prompt_defaults_to_normal_request_tokens_without_diagnostics():
     assert _live_prompt_ids(request) == ([11, 13, 17], [11, 13, 17], [], "", 0)
 
 
+def test_live_prompt_uses_server_owned_full_view_only_for_full_driver():
+    request = SimpleNamespace(
+        prompt_token_ids=[11, 13, 17],
+        sampling_params=SimpleNamespace(
+            extra_args={"specsteer_aug_prompt_ids": [2, 3, 5, 7, 11, 13, 17]}
+        ),
+    )
+
+    assert _live_prompt_ids(request) == (
+        [2, 3, 5, 7, 11, 13, 17],
+        [11, 13, 17],
+        [],
+        "",
+        0,
+    )
+
+
+def test_server_owned_full_view_cannot_be_shorter_than_compressed_view():
+    request = SimpleNamespace(
+        prompt_token_ids=[11, 13, 17],
+        sampling_params=SimpleNamespace(extra_args={"specsteer_aug_prompt_ids": [11]}),
+    )
+
+    with pytest.raises(ValueError, match="cannot be shorter"):
+        _live_prompt_ids(request)
+
+
 def test_scheduler_transports_asymspec_pair_through_normal_v1_path():
     scheduler = create_scheduler(num_speculative_tokens=2)
     assert scheduler.vllm_config.speculative_config is not None
