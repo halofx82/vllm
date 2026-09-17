@@ -13,6 +13,7 @@ from .verifier_bridge import (
     DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
     DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT,
     DIAGNOSTIC_FIXED_ACCEPTED_COUNT,
+    DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS,
     DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_OUTPUT_PATH,
     DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH,
@@ -33,6 +34,75 @@ class AsymSpecFixedAcceptanceOutcome:
     accepted_count: int
     next_seed_token_id: int
     output_token_ids: torch.Tensor
+
+
+def force_asymspec_diagnostic_decode_outputs(
+    *,
+    sampled_token_ids: torch.Tensor,
+    scheduler_output: SchedulerOutput,
+    requests: dict[str, CachedRequestState],
+    req_id_to_index: dict[str, int],
+    is_asymspec: bool,
+) -> bool:
+    """Force requested ordinary sampler outputs for a control request.
+
+    The target forward and native sampler have already run when this helper
+    is called.  We replace only the emitted ID before V1's existing hybrid
+    state update and scheduler bookkeeping consume it.  This keeps the
+    canonical control on ordinary decode transitions rather than constructing
+    accepted tokens in prefill or by mutating a Request.
+    """
+    if not is_asymspec:
+        return False
+
+    matches: list[tuple[str, int | None]] = []
+    for request_id in scheduler_output.num_scheduled_tokens:
+        if request_id in scheduler_output.scheduled_spec_decode_tokens:
+            continue
+        state = requests.get(request_id)
+        params = None if state is None else state.sampling_params
+        extra_args = None if params is None else params.extra_args
+        if not extra_args or DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS not in extra_args:
+            continue
+        # The bootstrap sampler must create S itself.  Force only subsequent
+        # ordinary decode outputs, after S is canonical-but-uncomputed.
+        if not state.output_token_ids:
+            continue
+        tokens = extra_args[DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS]
+        index = getattr(state, "_asymspec_forced_decode_index", 0)
+        if not isinstance(tokens, (list, tuple)) or any(
+            token is not None and (not isinstance(token, int) or token < 0)
+            for token in tokens
+        ):
+            raise ValueError(
+                "AsymSpec forced decode tokens must be non-negative integers or None."
+            )
+        if index < len(tokens):
+            token = tokens[index]
+            matches.append((request_id, None if token is None else int(token)))
+
+    if not matches:
+        return False
+    if len(matches) != 1:
+        raise RuntimeError(
+            "AsymSpec forced decode control supports one isolated request."
+        )
+    request_id, token_id = matches[0]
+    request_index = req_id_to_index.get(request_id)
+    if request_index is None or sampled_token_ids.ndim != 2:
+        raise RuntimeError("AsymSpec forced decode received invalid sampler output.")
+    if sampled_token_ids.shape[1] != 1:
+        raise RuntimeError(
+            "AsymSpec forced decode only supports ordinary one-token steps."
+        )
+    state = requests[request_id]
+    state._asymspec_forced_decode_index = (
+        getattr(state, "_asymspec_forced_decode_index", 0) + 1
+    )
+    if token_id is None:
+        return False
+    sampled_token_ids[request_index, 0] = token_id
+    return True
 
 
 def persist_asymspec_fixed_acceptance_outcome(
@@ -254,6 +324,15 @@ def capture_asymspec_verifier_rows(
         row_prefix = "next_" if is_follow_up else ""
         capture = {
             "request_id": request_id,
+            # Read-only state facts for the ordinary-decode control.  These
+            # are captured before the disposable verifier is finished, never
+            # used to drive request state.
+            f"{row_prefix}output_token_ids": list(
+                getattr(state, "output_token_ids", ())
+            ),
+            f"{row_prefix}num_computed_tokens": getattr(
+                state, "num_computed_tokens", None
+            ),
             f"{row_prefix}candidate_token_ids": tokens,
             f"{row_prefix}scheduled_spec_decode_tokens": tokens,
             f"{row_prefix}target_logits_indices": target_indices.tolist(),

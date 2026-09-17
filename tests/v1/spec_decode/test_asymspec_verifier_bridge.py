@@ -10,11 +10,13 @@ from vllm.v1.spec_decode.asymspec.live_iteration import _live_prompt_ids
 from vllm.v1.spec_decode.asymspec.target_diagnostic import (
     build_asymspec_fixed_acceptance_outcome,
     capture_asymspec_verifier_rows,
+    force_asymspec_diagnostic_decode_outputs,
 )
 from vllm.v1.spec_decode.asymspec.verifier_bridge import (
     DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
     DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT,
     DIAGNOSTIC_FIXED_ACCEPTED_COUNT,
+    DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS,
     DIAGNOSTIC_LIVE_BASE_LAG_TOKENS,
     DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
@@ -113,6 +115,116 @@ def test_target_control_arms_only_after_ordinary_seed_and_decode():
     request.num_output_tokens = 2
     assert arm_asymspec_diagnostic_control_spec_tokens(request, config)
     assert request.spec_token_ids == [13, 17]
+
+
+def test_forced_decode_replaces_only_post_seed_ordinary_output():
+    state = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS: [13, 17]}
+        ),
+        output_token_ids=[31],
+    )
+    sampled = torch.tensor([[41]], dtype=torch.int32)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"control": 1},
+        scheduled_spec_decode_tokens={},
+    )
+    assert force_asymspec_diagnostic_decode_outputs(
+        sampled_token_ids=sampled,
+        scheduler_output=scheduler_output,
+        requests={"control": state},
+        req_id_to_index={"control": 0},
+        is_asymspec=True,
+    )
+    assert sampled.tolist() == [[13]]
+    assert state._asymspec_forced_decode_index == 1
+
+
+def test_forced_decode_does_not_touch_seed_or_speculative_step():
+    state = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS: [13]}
+        ),
+        output_token_ids=[],
+    )
+    sampled = torch.tensor([[41]], dtype=torch.int32)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"control": 1},
+        scheduled_spec_decode_tokens={},
+    )
+    assert not force_asymspec_diagnostic_decode_outputs(
+        sampled_token_ids=sampled,
+        scheduler_output=scheduler_output,
+        requests={"control": state},
+        req_id_to_index={"control": 0},
+        is_asymspec=True,
+    )
+    state.output_token_ids = [31]
+    scheduler_output.scheduled_spec_decode_tokens = {"control": [13, 17]}
+    assert not force_asymspec_diagnostic_decode_outputs(
+        sampled_token_ids=sampled,
+        scheduler_output=scheduler_output,
+        requests={"control": state},
+        req_id_to_index={"control": 0},
+        is_asymspec=True,
+    )
+    assert sampled.tolist() == [[41]]
+
+
+def test_forced_decode_none_leaves_greedy_output_but_consumes_control_slot():
+    state = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS: [None, 17]}
+        ),
+        output_token_ids=[31],
+    )
+    sampled = torch.tensor([[41]], dtype=torch.int32)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"control": 1},
+        scheduled_spec_decode_tokens={},
+    )
+    assert not force_asymspec_diagnostic_decode_outputs(
+        sampled_token_ids=sampled,
+        scheduler_output=scheduler_output,
+        requests={"control": state},
+        req_id_to_index={"control": 0},
+        is_asymspec=True,
+    )
+    assert sampled.tolist() == [[41]]
+    assert state._asymspec_forced_decode_index == 1
+
+
+def test_verifier_capture_records_control_state_without_mutation(tmp_path):
+    request_id = "control"
+    state = SimpleNamespace(
+        output_token_ids=[31, 13, 41],
+        num_computed_tokens=9,
+        sampling_params=SimpleNamespace(
+            extra_args={
+                DIAGNOSTIC_CANDIDATE_TOKEN_IDS: [43, 47],
+                DIAGNOSTIC_VERIFIER_OUTPUT_PATH: str(tmp_path / "rows.pt"),
+            }
+        ),
+    )
+    metadata = SimpleNamespace(
+        num_draft_tokens=[2],
+        target_logits_indices=torch.tensor([0, 1]),
+        bonus_logits_indices=torch.tensor([2]),
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={request_id: [43, 47]}
+    )
+    assert capture_asymspec_verifier_rows(
+        scheduler_output=scheduler_output,
+        spec_decode_metadata=metadata,
+        logits=torch.randn(3, 64),
+        requests={request_id: state},
+        is_asymspec=True,
+    )
+    capture = torch.load(tmp_path / "rows.pt", weights_only=False)
+    assert capture["output_token_ids"] == [31, 13, 41]
+    assert capture["num_computed_tokens"] == 9
+    assert state.output_token_ids == [31, 13, 41]
 
 
 def test_live_preseed_commits_are_the_only_deferred_base_range():

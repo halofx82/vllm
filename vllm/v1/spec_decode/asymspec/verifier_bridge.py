@@ -26,6 +26,12 @@ DIAGNOSTIC_FIXED_ACCEPTED_COUNT = "asymspec_diagnostic_fixed_accepted_count"
 DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS = "asymspec_diagnostic_next_spec_token_ids"
 DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH = "asymspec_diagnostic_target_control_output_path"
 DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT = "asymspec_diagnostic_arm_after_output_count"
+# Test-only ordinary-decode control.  Each ID replaces exactly one ordinary
+# sampler output *after* its real model forward and before normal V1
+# bookkeeping.  It must never be used on a speculative verifier step.
+DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS = (
+    "asymspec_diagnostic_forced_decode_token_ids"
+)
 
 
 def arm_asymspec_diagnostic_next_spec_tokens(

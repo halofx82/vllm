@@ -4807,6 +4807,7 @@ class GPUModelRunner(
             from vllm.v1.spec_decode.asymspec.target_diagnostic import (
                 build_asymspec_fixed_acceptance_outcome,
                 capture_asymspec_verifier_rows,
+                force_asymspec_diagnostic_decode_outputs,
                 persist_asymspec_fixed_acceptance_outcome,
             )
             from vllm.v1.spec_decode.asymspec.verifier_bridge import (
@@ -4914,6 +4915,19 @@ class GPUModelRunner(
                 sampler_output = self._sample(logits, spec_decode_metadata)
 
         assert sampler_output is not None
+        if self.speculative_config is not None and (
+            self.speculative_config.method == "asymspec"
+        ):
+            # Opt-in canonical-control hook.  It runs after the real ordinary
+            # sampler but before V1 state/bookkeeping, and explicitly rejects
+            # speculative verifier steps in its helper.
+            force_asymspec_diagnostic_decode_outputs(
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                scheduler_output=scheduler_output,
+                requests=self.requests,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                is_asymspec=True,
+            )
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
