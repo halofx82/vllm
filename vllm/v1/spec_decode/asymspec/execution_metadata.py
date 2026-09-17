@@ -9,12 +9,11 @@ trees, using the role-owned request tables established by ``request_state``.
 
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import dataclass
 
 import torch
 
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionMetadata, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -312,14 +311,12 @@ def build_asymspec_view_execution_metadata(
     draft_vllm_config = getattr(views, "draft_vllm_config", None)
     if draft_vllm_config is None:
         draft_vllm_config = vllm_config
-    # Metadata builders consult ``cache_config.mamba_cache_mode`` in addition
-    # to their supplied MambaSpec.  Isolate it from TARGET's align mode even
-    # when a caller has subsequently normalized the parent config in-place.
-    draft_cache_config = copy(draft_vllm_config.cache_config)
-    draft_cache_config.mamba_cache_mode = "none"
-    draft_vllm_config = replace(
-        draft_vllm_config, cache_config=draft_cache_config
-    )
+    # ``AsymSpecDraftViews`` created this role-local configuration with compact
+    # Mamba state.  Do not reconstruct it here: V1 validates mamba block
+    # geometry against prefix caching during ``replace()``, while frozen
+    # serving legitimately runs its asymmetric requests with prefix caching
+    # disabled.  The draft configuration is independent from TARGET's align
+    # configuration, so using it directly retains the compact contract.
     positions = torch.arange(query_start, query_end, dtype=torch.int64, device=device)
     tables = request_state.block_tables
     attention_group = (
