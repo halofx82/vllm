@@ -4996,6 +4996,10 @@ class GPUModelRunner(
             and self.speculative_config.method == "asymspec"
             and spec_decode_metadata is None
         ):
+            from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+                is_asymspec_target_only_request,
+            )
+
             # Frozen C1 bootstrap is defined on each raw prompt-boundary
             # TARGET row, before the ordinary sampler applies transforms.
             # The direct-engine production fallback resolves FULL/BASE from
@@ -5005,6 +5009,7 @@ class GPUModelRunner(
                 request = self.requests.get(request_id)
                 if (
                     request is not None
+                    and not is_asymspec_target_only_request(request)
                     and not request.output_token_ids
                     and request.num_computed_tokens
                     + scheduler_output.num_scheduled_tokens[request_id]
