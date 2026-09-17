@@ -46,6 +46,12 @@ from .draft_forward import (
     qwen3_5_text_positions,
 )
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
+from .evidence_rollout import AsymSpecEvidenceCarrierRecord, AsymSpecEvidenceRollout
+from .evidence_transfer import (
+    AsymSpecEvidenceRecord,
+    evidence_wrapper,
+    select_evidence,
+)
 from .execution_metadata import (
     AsymSpecMetadataGroup,
     AsymSpecViewExecutionMetadata,
@@ -116,6 +122,9 @@ __all__ = [
     "AsymSpecFullK2Proposer",
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftSignal",
+    "AsymSpecEvidenceCarrierRecord",
+    "AsymSpecEvidenceRecord",
+    "AsymSpecEvidenceRollout",
     "AsymSpecContextCausalDecision",
     "AsymSpecPolicyRow",
     "AsymSpecTargetRowCapture",
@@ -170,6 +179,8 @@ __all__ = [
     "bind_asymspec_draft_caches",
     "allocate_synthetic_attention_blocks",
     "build_asymspec_logical_cache_plan",
+    "evidence_wrapper",
+    "select_evidence",
     "build_asymspec_physical_cache_plan",
     "build_asymspec_view_execution_metadata",
     "build_asymspec_draft_signal",

@@ -35,6 +35,23 @@ DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT = "asymspec_diagnostic_arm_after_output_count"
 DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS = (
     "asymspec_diagnostic_forced_decode_token_ids"
 )
+# Frozen Step-51 is an external two-request workflow.  The carrier runner
+# supplies this rank-zero artifact destination; workers never own messages or
+# construct the final target-only request.
+EVIDENCE_CARRIER_OUTPUT_PATH = "asymspec_evidence_carrier_output_path"
+ASYMSPEC_EXECUTION_MODE = "asymspec_execution_mode"
+ASYMSPEC_TARGET_ONLY_EXECUTION_MODE = "target_only"
+
+
+def is_asymspec_target_only_request(request: Request) -> bool:
+    """Whether frozen's external evidence runner requested final TARGET-only work."""
+    params = request.sampling_params
+    extra_args = None if params is None else params.extra_args
+    return bool(
+        extra_args
+        and extra_args.get(ASYMSPEC_EXECUTION_MODE)
+        == ASYMSPEC_TARGET_ONLY_EXECUTION_MODE
+    )
 
 
 def arm_asymspec_diagnostic_next_spec_tokens(

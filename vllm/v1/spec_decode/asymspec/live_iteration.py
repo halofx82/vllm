@@ -28,6 +28,7 @@ from .cache_plan import (
 from .canonical_driver import AsymSpecCanonicalDraftDriver
 from .context_causal_policy import context_causal_bootstrap_token
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
+from .evidence_rollout import AsymSpecEvidenceCarrierRecord, AsymSpecEvidenceRollout
 from .logical_cache import (
     AsymSpecLogicalBlockPoolRuntime,
     build_asymspec_logical_cache_plan,
@@ -46,6 +47,7 @@ from .verifier_bridge import (
     DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_OUTPUT_PATH,
     DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS,
+    EVIDENCE_CARRIER_OUTPUT_PATH,
 )
 from .views import AsymSpecViewRole
 
@@ -85,6 +87,7 @@ class AsymSpecLiveIterationRuntime:
     bootstrap_context_lift: float | None = None
     identical_context_views: bool = False
     last_policy_decision: object | None = None
+    evidence_carrier_record: AsymSpecEvidenceCarrierRecord | None = None
     _full_accept_bonus_prepared: bool = False
     _full_accept_bonus_target_only: bool = False
 
@@ -123,6 +126,25 @@ class AsymSpecLiveIterationRuntime:
             },
             path,
         )
+
+    def write_evidence_carrier_record(self, path_value: str) -> None:
+        """Serialize the frozen carrier payload for the external runner."""
+        if not path_value or self.evidence_carrier_record is None:
+            return
+        import json
+
+        path = Path(path_value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.evidence_carrier_record.json()
+        payload.update(
+            {
+                "request_id": self.request_id,
+                "rollout_tokens": 8,
+                "full_prompt_end": self.full.prompt_len,
+                "base_prompt_end": self.base.prompt_len,
+            }
+        )
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
     def rollback_and_release(self) -> None:
         """Discard only candidate state; BASE remains canonical through the seed."""
@@ -414,10 +436,7 @@ def begin_asymspec_live_iteration(
     base_capacity = views.base.state.cache_plan.max_model_len
     required_full_capacity = len(full_ids) + len(preseed_ids) + 3
     required_base_capacity = len(base_ids) + len(preseed_ids) + 3
-    if (
-        required_full_capacity > full_capacity
-        or required_base_capacity > base_capacity
-    ):
+    if required_full_capacity > full_capacity or required_base_capacity > base_capacity:
         raise ValueError("AsymSpec live request prompt exceeds configured draft cache.")
     foundation = getattr(runner, "_asymspec_live_foundation", None)
     if foundation is None:
@@ -479,6 +498,21 @@ def begin_asymspec_live_iteration(
     base_prefill = base.prefill(
         torch.tensor(base_ids, dtype=torch.int32, device=runner.device)
     )
+    extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+    carrier_path = extra_args.get(EVIDENCE_CARRIER_OUTPUT_PATH)
+    if carrier_path and not isinstance(carrier_path, str):
+        raise ValueError("AsymSpec evidence carrier output path must be a string.")
+    evidence_record = None
+    speculative_config = runner.vllm_config.speculative_config
+    if (
+        speculative_config is not None
+        and speculative_config.asymspec_evidence_mode == "one_shot"
+        and carrier_path
+    ):
+        # Frozen Step-51 captures before bootstrap C1 mutates the seed.  The
+        # resulting branch state is fully restored before normal production
+        # bootstrap continues.
+        evidence_record = AsymSpecEvidenceRollout(full=full, base=base).capture()
     bootstrap_target_token_id = None
     bootstrap_fused_token_id = None
     bootstrap_context_lift = None
@@ -527,7 +561,7 @@ def begin_asymspec_live_iteration(
         a1=proposal.candidate_results[0].logits[0],
         b1=base_score.logits_before_b.logits[0],
     )
-    return AsymSpecLiveIterationRuntime(
+    runtime = AsymSpecLiveIterationRuntime(
         request_id=request.req_id,
         seed_token_id=int(seed_token_id),
         request_state=state,
@@ -546,4 +580,10 @@ def begin_asymspec_live_iteration(
         bootstrap_fused_token_id=bootstrap_fused_token_id,
         bootstrap_context_lift=bootstrap_context_lift,
         identical_context_views=full_ids == base_ids,
+        evidence_carrier_record=evidence_record,
     )
+    if carrier_path and (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    ):
+        runtime.write_evidence_carrier_record(carrier_path)
+    return runtime
