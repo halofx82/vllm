@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Diagnostic live AsymSpec seed-to-verifier iterations.
+"""Request-local live AsymSpec seed-to-verifier iterations.
 
 It turns the target sampler's ordinary, still-uncomputed output token into
 canonical FULL/BASE work, keeps the FULL K=2 transaction live, and returns
-its pair to the V1 scheduler.  The test-only fixed-outcome path can then
-apply a supplied accepted count to the draft views after the target has
-selected its next seed.  TARGET itself remains entirely on the normal V1
-path.
+its pair to the V1 scheduler. TARGET itself remains entirely on the normal
+V1 path; diagnostic capture and fixed-outcome control are optional overlays.
 """
 
 from __future__ import annotations
@@ -58,7 +56,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class AsymSpecLiveIterationRuntime:
-    """Persistent draft state for one diagnostic live request."""
+    """Persistent request-local draft state for one live request."""
 
     request_id: str
     seed_token_id: int
@@ -71,7 +69,8 @@ class AsymSpecLiveIterationRuntime:
     proposal: AsymSpecFullK2Proposal
     base_score: AsymSpecBasePairScore
     signal: AsymSpecDraftSignal
-    output_path: str
+    # Empty outside explicit diagnostics. It is never required by production.
+    output_path: str = ""
     base_lag_tokens: int = 0
     authoritative_suffix_token_ids: list[int] = field(default_factory=list)
     last_accepted_token_ids: tuple[int, ...] = ()
@@ -93,6 +92,8 @@ class AsymSpecLiveIterationRuntime:
 
     def write_draft_capture(self) -> None:
         """Write rank-zero diagnostic vectors before native verifier execution."""
+        if not self.output_path:
+            return
         path = Path(self.output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -259,6 +260,8 @@ class AsymSpecLiveIterationRuntime:
         self, *, accepted_count: int, next_seed_token_id: int
     ) -> None:
         """Persist compact post-transition facts for the live-chain harness."""
+        if not self.output_path:
+            return
         path = Path(self.output_path)
         if not path.exists():
             return
@@ -321,10 +324,24 @@ class AsymSpecLiveIterationRuntime:
 def _live_prompt_ids(
     request: CachedRequestState,
 ) -> tuple[list[int], list[int], list[int], str, int] | None:
+    """Resolve production FULL/BASE coordinates for one target request.
+
+    Frozen SCALE1 uses the native compressed prompt for both views in direct
+    engine mode. A server-owned augmented prompt can override that fallback;
+    the existing extra-arg form remains available solely for diagnostics and
+    future serving-side context construction.
+    """
     params = request.sampling_params
     extra_args = None if params is None else params.extra_args
     if not extra_args or DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS not in extra_args:
-        return None
+        prompt_ids = request.prompt_token_ids
+        if not prompt_ids:
+            raise ValueError(
+                "AsymSpec production requires token-ID prompts; prompt embeds "
+                "do not define a draft token coordinate system."
+            )
+        ids = [int(token) for token in prompt_ids]
+        return ids, ids.copy(), [], "", 0
     required = (
         DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
         DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS,
@@ -370,12 +387,12 @@ def begin_asymspec_live_iteration(
         return None
     full_ids, base_ids, preseed_ids, output_path, base_lag = prompt_data
     if seed_token_id < 0:
-        raise ValueError("AsymSpec live diagnostic seed must be non-negative.")
+        raise ValueError("AsymSpec live seed must be non-negative.")
     views = getattr(runner, "asymspec_draft_views", None)
     if views is None:
-        raise RuntimeError("AsymSpec live diagnostic requires initialized draft views.")
+        raise RuntimeError("AsymSpec live request requires initialized draft views.")
     required_capacity = max(len(full_ids), len(base_ids)) + len(preseed_ids) + 3
-    foundation = getattr(runner, "_asymspec_live_diagnostic_foundation", None)
+    foundation = getattr(runner, "_asymspec_live_foundation", None)
     if foundation is None:
         # Draft module bindings are deliberately permanent.  Unlike the old
         # per-RPC diagnostics, a live V1 iteration must retain that one
@@ -384,7 +401,7 @@ def begin_asymspec_live_iteration(
         base_capacity = views.base.state.cache_plan.max_model_len
         if required_capacity > full_capacity or required_capacity > base_capacity:
             raise ValueError(
-                "AsymSpec live diagnostic prompt exceeds configured cache."
+                "AsymSpec live request prompt exceeds configured draft cache."
             )
         target_specs = runner.get_kv_cache_spec()
         global_plan: AsymSpecGlobalCachePlan = compose_asymspec_global_cache_plan(
@@ -415,7 +432,7 @@ def begin_asymspec_live_iteration(
             vllm_config=runner.vllm_config,
         )
         foundation = (physical, logical, bindings)
-        runner._asymspec_live_diagnostic_foundation = foundation
+        runner._asymspec_live_foundation = foundation
     physical, logical, bindings = foundation
     state = create_asymspec_request_state(
         request_id=f"live-{request.req_id}",

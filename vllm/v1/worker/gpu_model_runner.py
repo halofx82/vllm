@@ -4377,6 +4377,20 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        # Scheduler-side request finish is transported before the next model
+        # execution. Release only request-local draft state whose owner has
+        # disappeared; the shared physical AsymSpec foundation remains bound
+        # for later requests.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "asymspec"
+        ):
+            active_live = getattr(self, "_asymspec_live_iterations", None)
+            if active_live:
+                for request_id in list(active_live):
+                    if request_id not in self.requests:
+                        active_live.pop(request_id).rollback_and_release()
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -4923,6 +4937,30 @@ class GPUModelRunner(
             disposable_capture_request_ids = (
                 live_capture_request_ids | control_capture_request_ids
             )
+            if acceptance_outcome is not None:
+                # Production and fixed-count diagnostics both express their
+                # result in the native rejection-sampler layout. TARGET
+                # recurrent selection has already happened above; unchanged
+                # V1 bookkeeping owns output append, logical rollback, and
+                # the next canonical-but-uncomputed seed.  Preserve ordinary
+                # rows when this verifier shares a V1 batch with a prefill or
+                # decode request: the policy replaces only its own
+                # rejection-sampler row.
+                sampler_output = self._sample(logits, spec_decode_metadata)
+                request_index = self.input_batch.req_id_to_index.get(
+                    acceptance_outcome.request_id
+                )
+                if (
+                    request_index is None
+                    or sampler_output.sampled_token_ids.shape[1]
+                    != acceptance_outcome.output_token_ids.shape[1]
+                ):
+                    raise RuntimeError(
+                        "AsymSpec policy could not replace its V1 sampler row."
+                    )
+                sampler_output.sampled_token_ids[request_index] = (
+                    acceptance_outcome.output_token_ids[0]
+                )
             if captured_verifier_rows and disposable_capture_request_ids:
                 # This diagnostic's sole product is the pre-sampling
                 # verifier rows. RejectionSampler requires an acceptance
@@ -4934,16 +4972,7 @@ class GPUModelRunner(
                     raise RuntimeError(
                         "AsymSpec live verifier diagnostic requires sync scheduling."
                     )
-                if acceptance_outcome is not None:
-                    # Continue below through the unmodified native bookkeeping
-                    # path.  The result has the same padded layout as a normal
-                    # rejection sampler output, so V1 owns rollback, hybrid
-                    # post-processing, output append, and the next seed.
-                    sampler_output = SamplerOutput(
-                        sampled_token_ids=acceptance_outcome.output_token_ids,
-                        logprobs_tensors=None,
-                    )
-                else:
+                if acceptance_outcome is None:
                     self._draft_token_ids = None
                     self._draft_probs = None
                     self._draft_prob_req_ids = None
@@ -4960,80 +4989,91 @@ class GPUModelRunner(
                         kv_connector_output=self.kv_connector_output,
                     )
 
-        live_policy_bootstrap: tuple[str, torch.Tensor] | None = None
+        live_policy_bootstrap: list[tuple[str, torch.Tensor]] = []
         if (
             sampler_output is None
             and self.speculative_config is not None
             and self.speculative_config.method == "asymspec"
             and spec_decode_metadata is None
         ):
-            # Frozen C1 bootstrap is defined on the raw prompt-boundary
-            # TARGET row. Preserve it before the ordinary sampler is allowed
-            # to apply any in-place transforms. It is intentionally limited
-            # to the isolated single-request live-policy harness.
-            from vllm.v1.spec_decode.asymspec.verifier_bridge import (
-                DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY,
-                DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
-            )
-
-            candidates = []
+            # Frozen C1 bootstrap is defined on each raw prompt-boundary
+            # TARGET row, before the ordinary sampler applies transforms.
+            # The direct-engine production fallback resolves FULL/BASE from
+            # the request prompt itself; serving may later supply an augmented
+            # FULL view without changing this lifecycle.
             for request_id in scheduler_output.num_scheduled_tokens:
                 request = self.requests.get(request_id)
-                params = None if request is None else request.sampling_params
-                extra = None if params is None else params.extra_args
                 if (
-                    extra
-                    and extra.get(DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY)
-                    and DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS in extra
+                    request is not None
                     and not request.output_token_ids
+                    and request.num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens[request_id]
+                    >= request.num_prompt_tokens
                 ):
-                    candidates.append(request_id)
-            if candidates:
-                if len(candidates) != 1 or logits is None or logits.shape[0] < 1:
-                    raise RuntimeError(
-                        "AsymSpec C1 bootstrap supports one live prompt request."
+                    request_index = self.input_batch.req_id_to_index.get(request_id)
+                    if (
+                        logits is None
+                        or request_index is None
+                        or request_index >= logits.shape[0]
+                    ):
+                        raise RuntimeError(
+                            "AsymSpec bootstrap could not resolve its target row."
+                        )
+                    live_policy_bootstrap.append(
+                        (request_id, logits[request_index].clone())
                     )
-                live_policy_bootstrap = (candidates[0], logits[-1].clone())
 
         if sampler_output is None:
             with record_function_or_nullcontext("gpu_model_runner: sample"):
                 sampler_output = self._sample(logits, spec_decode_metadata)
 
-        if live_policy_bootstrap is not None:
+        if live_policy_bootstrap:
             from vllm.v1.spec_decode.asymspec.live_iteration import (
                 begin_asymspec_live_iteration,
             )
 
-            request_id, target_logits = live_policy_bootstrap
-            request = self.requests[request_id]
-            request_index = self.input_batch.req_id_to_index.get(request_id)
-            if (
-                request_index is None
-                or sampler_output.sampled_token_ids.shape != (1, 1)
-            ):
-                raise RuntimeError("AsymSpec C1 bootstrap requires one sampled token.")
             active_live = getattr(self, "_asymspec_live_iterations", None)
             if active_live is None:
                 active_live = {}
                 self._asymspec_live_iterations = active_live
-            if request_id in active_live:
-                raise RuntimeError("AsymSpec C1 bootstrap already has live state.")
-            runtime = begin_asymspec_live_iteration(
-                runner=self,
-                request=request,
-                seed_token_id=int(sampler_output.sampled_token_ids[request_index, 0]),
-                bootstrap_target_logits=target_logits,
-            )
-            if runtime is None:
-                raise RuntimeError("AsymSpec C1 bootstrap did not create live state.")
-            sampler_output.sampled_token_ids[request_index, 0] = runtime.seed_token_id
-            active_live[request_id] = runtime
-            asymspec_live_spec_token_ids[request_id] = runtime.candidate_token_ids
-            if (
-                not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0
-            ):
-                runtime.write_draft_capture()
+            if sampler_output.sampled_token_ids.ndim != 2:
+                raise RuntimeError(
+                    "AsymSpec C1 bootstrap received invalid sample rows."
+                )
+            for request_id, target_logits in live_policy_bootstrap:
+                request = self.requests[request_id]
+                request_index = self.input_batch.req_id_to_index.get(request_id)
+                if (
+                    request_index is None
+                    or sampler_output.sampled_token_ids.shape[1] != 1
+                ):
+                    raise RuntimeError(
+                        "AsymSpec C1 bootstrap requires one sampled token."
+                    )
+                if request_id in active_live:
+                    raise RuntimeError("AsymSpec C1 bootstrap already has live state.")
+                runtime = begin_asymspec_live_iteration(
+                    runner=self,
+                    request=request,
+                    seed_token_id=int(
+                        sampler_output.sampled_token_ids[request_index, 0]
+                    ),
+                    bootstrap_target_logits=target_logits,
+                )
+                if runtime is None:
+                    raise RuntimeError(
+                        "AsymSpec C1 bootstrap did not create live state."
+                    )
+                sampler_output.sampled_token_ids[request_index, 0] = (
+                    runtime.seed_token_id
+                )
+                active_live[request_id] = runtime
+                asymspec_live_spec_token_ids[request_id] = runtime.candidate_token_ids
+                if (
+                    not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                ):
+                    runtime.write_draft_capture()
 
         assert sampler_output is not None
         if self.speculative_config is not None and (

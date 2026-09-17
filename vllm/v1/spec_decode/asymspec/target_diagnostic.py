@@ -19,7 +19,6 @@ from .verifier_bridge import (
     DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
     DIAGNOSTIC_FIXED_ACCEPTED_COUNT,
     DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS,
-    DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY,
     DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_OUTPUT_PATH,
     DIAGNOSTIC_TARGET_CONTROL_OUTPUT_PATH,
@@ -68,12 +67,11 @@ def build_asymspec_context_causal_outcome(
     active_live: dict[str, object] | None,
     is_asymspec: bool,
 ) -> AsymSpecContextCausalOutcome | None:
-    """Adapt frozen pure C1/JSD policy to the existing isolated live runtime.
+    """Adapt frozen pure C1/JSD policy to one live AsymSpec request.
 
-    This is deliberately narrower than generic sampling: only an explicitly
-    marked AsymSpec live request can enter it.  The returned padded tensor is
-    consumed by unchanged V1 speculative bookkeeping just like the existing
-    fixed-count diagnostic output.
+    The returned padded tensor is consumed by unchanged V1 speculative
+    bookkeeping. Fixed-count control remains an explicit diagnostic override;
+    ordinary ``method='asymspec'`` requests enter this production path.
     """
     if (
         not is_asymspec
@@ -87,12 +85,7 @@ def build_asymspec_context_causal_outcome(
         request_id,
         candidate_ids,
     ) in scheduler_output.scheduled_spec_decode_tokens.items():
-        state = requests.get(request_id)
-        params = None if state is None else state.sampling_params
-        extra = None if params is None else params.extra_args
         runtime = active_live.get(request_id)
-        if not extra or not extra.get(DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY):
-            continue
         if runtime is None:
             raise RuntimeError("AsymSpec context-causal request has no live runtime.")
         if len(candidate_ids) != 2:
@@ -100,11 +93,21 @@ def build_asymspec_context_causal_outcome(
         matches.append((request_id, [int(x) for x in candidate_ids], runtime))
     if not matches:
         return None
-    if len(matches) != 1 or spec_decode_metadata.num_draft_tokens != [2]:
-        raise RuntimeError("AsymSpec context-causal policy supports one K=2 request.")
+    active_spec_indices = [
+        index
+        for index, count in enumerate(spec_decode_metadata.num_draft_tokens)
+        if count
+    ]
     if (
-        spec_decode_metadata.target_logits_indices.numel() != 2
-        or spec_decode_metadata.bonus_logits_indices.numel() != 1
+        len(matches) != 1
+        or len(active_spec_indices) != 1
+        or spec_decode_metadata.num_draft_tokens[active_spec_indices[0]] != 2
+    ):
+        raise RuntimeError("AsymSpec context-causal policy supports one K=2 request.")
+    request_index = active_spec_indices[0]
+    draft_offset = sum(spec_decode_metadata.num_draft_tokens[:request_index])
+    if spec_decode_metadata.target_logits_indices.numel() < draft_offset + 2 or (
+        spec_decode_metadata.bonus_logits_indices.numel() <= request_index
     ):
         raise RuntimeError(
             "AsymSpec context-causal policy received invalid target rows."
@@ -115,9 +118,10 @@ def build_asymspec_context_causal_outcome(
     if tuple(candidates) != tuple(signal.candidate_token_ids):
         raise RuntimeError("AsymSpec target/FULL candidate pair mismatch.")
     t0, t1 = (
-        logits[int(spec_decode_metadata.target_logits_indices[i])] for i in range(2)
+        logits[int(spec_decode_metadata.target_logits_indices[draft_offset + i])]
+        for i in range(2)
     )
-    t2 = logits[int(spec_decode_metadata.bonus_logits_indices[0])]
+    t2 = logits[int(spec_decode_metadata.bonus_logits_indices[request_index])]
     prefix = evaluate_context_causal_prefix_k2(
         candidate_token_ids=tuple(candidates),
         full_logits=(signal.a0, signal.a1),

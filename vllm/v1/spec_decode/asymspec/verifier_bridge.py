@@ -144,36 +144,33 @@ def arm_asymspec_live_spec_tokens(
     speculative_config: SpeculativeConfig | None,
     candidate_token_ids: tuple[int, int] | list[int] | None,
 ) -> bool:
-    """Install a TP-produced pair after V1 has appended exactly one seed.
+    """Install a TP-produced pair at V1's native uncomputed-seed boundary.
 
-    This is deliberately a narrow diagnostic bridge.  It does not alter the
-    scheduler's normal speculative handling; it only supplies the ordinary
-    ``Request.spec_token_ids`` field at the native seed boundary.
+    The pair remains ordinary ``Request.spec_token_ids``: the scheduler owns
+    all later scheduling, rollback, output-limit, and finish behavior.  This
+    is the production bridge for ``method='asymspec'``; diagnostics only
+    control how the pair was obtained or captured.
     """
     if speculative_config is None or speculative_config.method != "asymspec":
         return False
-    params = request.sampling_params
-    extra_args = None if params is None else params.extra_args
-    if not extra_args or DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS not in extra_args:
-        return False
     if candidate_token_ids is None:
-        raise RuntimeError("AsymSpec live diagnostic did not return a K=2 pair.")
+        raise RuntimeError("AsymSpec live request did not return a K=2 pair.")
     tokens = [int(token) for token in candidate_token_ids]
     if len(tokens) != 2 or any(token < 0 for token in tokens):
-        raise ValueError("AsymSpec live diagnostic requires exactly two token IDs.")
+        raise ValueError("AsymSpec live request requires exactly two token IDs.")
     if request.spec_token_ids:
-        raise RuntimeError("AsymSpec live diagnostic cannot overwrite spec tokens.")
+        raise RuntimeError("AsymSpec live request cannot overwrite spec tokens.")
     # Bootstrap has one output; later fixed-outcome rounds have an accepted
     # suffix plus R.  In either case V1 must leave exactly that final seed
     # canonical-but-uncomputed when the next pair is armed.
     if request.num_output_tokens < 1:
-        raise RuntimeError("AsymSpec live diagnostic is missing its seed output.")
+        raise RuntimeError("AsymSpec live request is missing its seed output.")
     expected_computed = (
         request.num_prompt_tokens + request.num_output_tokens - 1
     )
     if request.num_computed_tokens != expected_computed:
         raise RuntimeError(
-            "AsymSpec live diagnostic must retain exactly one uncomputed seed: "
+            "AsymSpec live request must retain exactly one uncomputed seed: "
             f"computed={request.num_computed_tokens} expected={expected_computed} "
             f"prompt={request.num_prompt_tokens} outputs={request.num_output_tokens}."
         )

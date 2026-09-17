@@ -1949,7 +1949,11 @@ class Scheduler(SchedulerInterface):
                 live_pair = model_runner_output.asymspec_live_spec_token_ids.get(
                     req_id
                 )
-                if live_pair is not None:
+                # A final K=2 policy round may offer more authoritative
+                # tokens than remain under the ordinary V1 output budget.
+                # V1 has already trimmed and finished the request above;
+                # never arm a next speculative pair for that completed owner.
+                if live_pair is not None and not stopped:
                     arm_asymspec_live_spec_tokens(
                         request,
                         self.vllm_config.speculative_config,

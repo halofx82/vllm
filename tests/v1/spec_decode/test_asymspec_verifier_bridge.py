@@ -13,8 +13,8 @@ from vllm.v1.spec_decode.asymspec.target_diagnostic import (
     force_asymspec_diagnostic_decode_outputs,
 )
 from vllm.v1.spec_decode.asymspec.verifier_bridge import (
-    DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
     DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT,
+    DIAGNOSTIC_CANDIDATE_TOKEN_IDS,
     DIAGNOSTIC_FIXED_ACCEPTED_COUNT,
     DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS,
     DIAGNOSTIC_LIVE_BASE_LAG_TOKENS,
@@ -24,8 +24,8 @@ from vllm.v1.spec_decode.asymspec.verifier_bridge import (
     DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS,
     DIAGNOSTIC_NEXT_SPEC_TOKEN_IDS,
     DIAGNOSTIC_VERIFIER_OUTPUT_PATH,
-    arm_asymspec_live_spec_tokens,
     arm_asymspec_diagnostic_control_spec_tokens,
+    arm_asymspec_live_spec_tokens,
     register_asymspec_diagnostic_spec_tokens,
 )
 
@@ -82,6 +82,19 @@ def test_live_bridge_arms_only_at_the_uncomputed_seed_boundary():
     )
     assert request.spec_token_ids == [13, 17]
     assert request._asymspec_live_seed_token_id == 31
+
+
+def test_live_bridge_needs_no_diagnostic_request_fields():
+    request = _request()
+    request._output_token_ids = [31]
+    request.num_output_tokens = 1
+    request.num_computed_tokens = 2
+    request.num_prompt_tokens = 2
+
+    assert arm_asymspec_live_spec_tokens(
+        request, SimpleNamespace(method="asymspec"), (13, 17)
+    )
+    assert request.spec_token_ids == [13, 17]
 
 
 def test_live_bridge_rejects_a_computed_or_missing_seed():
@@ -266,6 +279,15 @@ def test_live_preseed_commits_are_the_only_deferred_base_range():
         "/tmp/live.pt",
         2,
     )
+
+
+def test_live_prompt_defaults_to_normal_request_tokens_without_diagnostics():
+    request = SimpleNamespace(
+        prompt_token_ids=[11, 13, 17],
+        sampling_params=SimpleNamespace(extra_args=None),
+    )
+
+    assert _live_prompt_ids(request) == ([11, 13, 17], [11, 13, 17], [], "", 0)
 
 
 def test_scheduler_transports_asymspec_pair_through_normal_v1_path():
