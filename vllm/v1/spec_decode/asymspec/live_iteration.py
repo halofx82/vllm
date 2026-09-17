@@ -28,6 +28,7 @@ from .cache_plan import (
     compose_asymspec_global_cache_plan,
 )
 from .canonical_driver import AsymSpecCanonicalDraftDriver
+from .context_causal_policy import context_causal_bootstrap_token
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
 from .logical_cache import (
     AsymSpecLogicalBlockPoolRuntime,
@@ -78,6 +79,13 @@ class AsymSpecLiveIterationRuntime:
     full_rollbacks: int = 0
     base_authoritative_tokens_observed: int = 0
     base_catch_up_tokens: int = 0
+    bootstrap_target_token_id: int | None = None
+    bootstrap_fused_token_id: int | None = None
+    bootstrap_context_lift: float | None = None
+    identical_context_views: bool = False
+    last_policy_decision: object | None = None
+    _full_accept_bonus_prepared: bool = False
+    _full_accept_bonus_target_only: bool = False
 
     @property
     def candidate_token_ids(self) -> tuple[int, int]:
@@ -106,6 +114,9 @@ class AsymSpecLiveIterationRuntime:
                 "base_catch_up_tokens": self.base_score.catch_up_tokens,
                 "full_transaction_active": self.proposal.transaction.active,
                 "historical_replay_tokens": 0,
+                "bootstrap_target_token_id": self.bootstrap_target_token_id,
+                "bootstrap_fused_token_id": self.bootstrap_fused_token_id,
+                "bootstrap_context_lift": self.bootstrap_context_lift,
             },
             path,
         )
@@ -115,6 +126,57 @@ class AsymSpecLiveIterationRuntime:
         if self.proposal.transaction.active:
             self.proposal.transaction.rollback()
         self.request_state.release()
+
+    @torch.no_grad()
+    def prepare_full_accept_bonus(
+        self, target_bonus_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, bool]:
+        """Port frozen full-accept bonus preparation without choosing a token.
+
+        Frozen SCALE1 first proves both K=2 draft positions acceptable, then
+        promotes their already-executed FULL state and catches BASE up through
+        the authoritative pair.  The resulting post-B rows are the inputs to
+        the pure C1 bonus decision against TARGET's ``t2``.  This method owns
+        only that established state preparation; it does not select or append
+        the bonus token.
+        """
+        if self._full_accept_bonus_prepared:
+            raise RuntimeError("AsymSpec FULL-accept bonus is already prepared.")
+        if not self.proposal.transaction.active:
+            raise RuntimeError("AsymSpec FULL candidate transaction is not active.")
+        if target_bonus_logits.ndim != 1:
+            raise ValueError("AsymSpec TARGET bonus logits must be one-dimensional.")
+        accepted = self.candidate_token_ids
+        result = self.proposal.transaction.promote(2)
+        if result is None:
+            raise AssertionError("AsymSpec full K=2 promotion returned no result.")
+        self.full_promoted_tokens += 2
+        full_bonus_logits = result.logits[0]
+        # Frozen deferred ``advance_context_bonus`` has an explicit
+        # evidence-free fast path: when FULL already agrees with TARGET's
+        # bonus row, retain TARGET's bonus and leave BASE deferred. BASE still
+        # observes A/B, then consumes them together with the bonus below.
+        target_only = self.identical_context_views or int(
+            full_bonus_logits.argmax().item()
+        ) == int(target_bonus_logits.argmax().item())
+        for token_id in accepted:
+            self.base.observe_committed_token(token_id)
+        self.base_authoritative_tokens_observed += 2
+        if target_only:
+            self._full_accept_bonus_target_only = True
+        else:
+            self.base.catch_up_base()
+            self.base_catch_up_tokens += 2
+            if self.request_state.base.pending_token_ids:
+                raise AssertionError(
+                    "AsymSpec BASE pending queue survived full accept."
+                )
+        self._full_accept_bonus_prepared = True
+        return (
+            full_bonus_logits,
+            None if target_only else self.base.last_result.logits[0],
+            target_only,
+        )
 
     @torch.no_grad()
     def apply_target_outcome(
@@ -130,35 +192,51 @@ class AsymSpecLiveIterationRuntime:
         """
         if accepted_count not in (0, 1, 2):
             raise ValueError("AsymSpec accepted count must be 0, 1, or 2.")
-        if not self.proposal.transaction.active:
+        if (
+            not self.proposal.transaction.active
+            and not self._full_accept_bonus_prepared
+        ):
             raise RuntimeError("AsymSpec live FULL transaction is not active.")
-        if self.proposal.transaction.candidate_token_ids != self.candidate_token_ids:
+        if (
+            not self._full_accept_bonus_prepared
+            and self.proposal.transaction.candidate_token_ids
+            != self.candidate_token_ids
+        ):
             raise RuntimeError("AsymSpec live FULL transaction pair mismatch.")
 
         accepted = self.candidate_token_ids[:accepted_count]
-        self.proposal.transaction.promote(accepted_count)
-        self.full_promoted_tokens += accepted_count
-        self.full_rollbacks += int(accepted_count == 0)
+        if self._full_accept_bonus_prepared:
+            if accepted_count != 2:
+                raise RuntimeError(
+                    "AsymSpec prepared full-accept bonus requires accepted_count=2."
+                )
+        else:
+            self.proposal.transaction.promote(accepted_count)
+            self.full_promoted_tokens += accepted_count
+            self.full_rollbacks += int(accepted_count == 0)
         self.full.commit_token(next_seed_token_id)
 
         # BASE scores A only disposably.  Every accepted token and R therefore
         # enters via the proven authoritative deferred queue before one packed
         # canonical catch-up forward.
-        for token_id in (*accepted, int(next_seed_token_id)):
+        pending_before_seed = len(self.request_state.base.pending_token_ids)
+        base_suffix = (
+            (int(next_seed_token_id),)
+            if self._full_accept_bonus_prepared
+            else (*accepted, int(next_seed_token_id))
+        )
+        for token_id in base_suffix:
             self.base.observe_committed_token(token_id)
-        self.base_authoritative_tokens_observed += len(accepted) + 1
+        self.base_authoritative_tokens_observed += len(base_suffix)
         self.base.catch_up_base()
-        self.base_catch_up_tokens += len(accepted) + 1
+        self.base_catch_up_tokens += pending_before_seed + len(base_suffix)
         if self.request_state.base.pending_token_ids:
             raise AssertionError("AsymSpec BASE pending queue survived outcome.")
         expected_full_len = (
-            self.base.canonical_len
-            + self.request_state.full.augmentation_offset
+            self.base.canonical_len + self.request_state.full.augmentation_offset
         )
         if self.full.canonical_len != expected_full_len:
-            raise AssertionError(
-                "AsymSpec FULL/BASE canonical coordinates diverged."
-            )
+            raise AssertionError("AsymSpec FULL/BASE canonical coordinates diverged.")
 
         self.proposal = AsymSpecFullK2Proposer(self.full).propose_k2()
         self.base_score = AsymSpecBasePairScorer(self.base).score_pair(
@@ -173,6 +251,8 @@ class AsymSpecLiveIterationRuntime:
         )
         self.authoritative_suffix_token_ids.extend((*accepted, int(next_seed_token_id)))
         self.last_accepted_token_ids = accepted
+        self._full_accept_bonus_prepared = False
+        self._full_accept_bonus_target_only = False
         return self.candidate_token_ids
 
     def append_outcome_capture(
@@ -183,29 +263,58 @@ class AsymSpecLiveIterationRuntime:
         if not path.exists():
             return
         capture = torch.load(path, weights_only=False)
-        capture.setdefault("live_sync_rows", []).append({
-            "accepted_count": int(accepted_count),
-            "next_seed_token_id": int(next_seed_token_id),
-            "accepted_token_ids": list(self.last_accepted_token_ids),
-            "authoritative_suffix_token_ids": list(
-                self.authoritative_suffix_token_ids
-            ),
-            "full_canonical_len": self.full.canonical_len,
-            "base_canonical_len": self.base.canonical_len,
-            "base_observed_len": self.request_state.base.observed_len,
-            "base_pending_tokens": list(self.request_state.base.pending_token_ids),
-            "next_candidate_token_ids": list(self.candidate_token_ids),
-            "full_promoted_tokens": self.full_promoted_tokens,
-            "full_rollbacks": self.full_rollbacks,
-            "base_authoritative_tokens_observed": (
-                self.base_authoritative_tokens_observed
-            ),
-            "base_catch_up_tokens": self.base_catch_up_tokens,
-            "next_a0": self.signal.a0.detach().cpu().to(torch.bfloat16),
-            "next_b0": self.signal.b0.detach().cpu().to(torch.bfloat16),
-            "next_a1": self.signal.a1.detach().cpu().to(torch.bfloat16),
-            "next_b1": self.signal.b1.detach().cpu().to(torch.bfloat16),
-        })
+        decision = self.last_policy_decision
+        policy = None
+        if decision is not None:
+            policy = {
+                "accepted_count": int(decision.accepted_count),
+                "output_token_ids": list(decision.output_token_ids),
+                "next_seed_token_id": int(decision.next_seed_token_id),
+                "used_bonus": bool(decision.used_bonus),
+                "bonus_token_id": decision.bonus_token_id,
+                "bonus_context_lift": decision.bonus_context_lift,
+                "rows": [
+                    {
+                        "position": row.position,
+                        "candidate_token_id": row.candidate_token_id,
+                        "target_token_id": row.target_token_id,
+                        "emitted_token_id": row.emitted_token_id,
+                        "accepted": row.accepted,
+                        "exact_target_match": row.exact_target_match,
+                        "jsd": row.jsd,
+                        "gamma_eff": row.gamma_eff,
+                        "cda_passed": row.cda_passed,
+                        "context_lift": row.context_lift,
+                    }
+                    for row in decision.rows
+                ],
+            }
+        capture.setdefault("live_sync_rows", []).append(
+            {
+                "accepted_count": int(accepted_count),
+                "next_seed_token_id": int(next_seed_token_id),
+                "accepted_token_ids": list(self.last_accepted_token_ids),
+                "authoritative_suffix_token_ids": list(
+                    self.authoritative_suffix_token_ids
+                ),
+                "full_canonical_len": self.full.canonical_len,
+                "base_canonical_len": self.base.canonical_len,
+                "base_observed_len": self.request_state.base.observed_len,
+                "base_pending_tokens": list(self.request_state.base.pending_token_ids),
+                "next_candidate_token_ids": list(self.candidate_token_ids),
+                "full_promoted_tokens": self.full_promoted_tokens,
+                "full_rollbacks": self.full_rollbacks,
+                "base_authoritative_tokens_observed": (
+                    self.base_authoritative_tokens_observed
+                ),
+                "base_catch_up_tokens": self.base_catch_up_tokens,
+                "next_a0": self.signal.a0.detach().cpu().to(torch.bfloat16),
+                "next_b0": self.signal.b0.detach().cpu().to(torch.bfloat16),
+                "next_a1": self.signal.a1.detach().cpu().to(torch.bfloat16),
+                "next_b1": self.signal.b1.detach().cpu().to(torch.bfloat16),
+                "policy": policy,
+            }
+        )
         torch.save(capture, path)
 
 
@@ -253,6 +362,7 @@ def begin_asymspec_live_iteration(
     runner: GPUModelRunner,
     request: CachedRequestState,
     seed_token_id: int,
+    bootstrap_target_logits: torch.Tensor | None = None,
 ) -> AsymSpecLiveIterationRuntime | None:
     """Consume V1's sampled seed in both draft views and make a live K=2 pair."""
     prompt_data = _live_prompt_ids(request)
@@ -325,8 +435,30 @@ def begin_asymspec_live_iteration(
     )
     full = AsymSpecCanonicalDraftDriver(role=AsymSpecViewRole.FULL, **common)
     base = AsymSpecCanonicalDraftDriver(role=AsymSpecViewRole.BASE, **common)
-    full.prefill(torch.tensor(full_ids, dtype=torch.int32, device=runner.device))
-    base.prefill(torch.tensor(base_ids, dtype=torch.int32, device=runner.device))
+    full_prefill = full.prefill(
+        torch.tensor(full_ids, dtype=torch.int32, device=runner.device)
+    )
+    base_prefill = base.prefill(
+        torch.tensor(base_ids, dtype=torch.int32, device=runner.device)
+    )
+    bootstrap_target_token_id = None
+    bootstrap_fused_token_id = None
+    bootstrap_context_lift = None
+    if bootstrap_target_logits is not None:
+        # Frozen ``context_causal_bootstrap`` runs after native sampling has
+        # produced its ordinary candidate, but before V1 commits that output.
+        # Its FULL/BASE rows are the just-prefilled prompt-boundary rows.
+        (
+            emitted_seed,
+            bootstrap_target_token_id,
+            bootstrap_fused_token_id,
+            bootstrap_context_lift,
+        ) = context_causal_bootstrap_token(
+            target_logits=bootstrap_target_logits,
+            full_logits=full_prefill.logits[0],
+            base_logits=base_prefill.logits[0],
+        )
+        seed_token_id = emitted_seed
     # The target seed is canonical-but-uncomputed only in V1 TARGET.  It is
     # immediately canonical and computed in both independent draft views.
     for token in preseed_ids:
@@ -372,4 +504,8 @@ def begin_asymspec_live_iteration(
         output_path=output_path,
         base_lag_tokens=base_lag,
         authoritative_suffix_token_ids=[*preseed_ids, int(seed_token_id)],
+        bootstrap_target_token_id=bootstrap_target_token_id,
+        bootstrap_fused_token_id=bootstrap_fused_token_id,
+        bootstrap_context_lift=bootstrap_context_lift,
+        identical_context_views=full_ids == base_ids,
     )

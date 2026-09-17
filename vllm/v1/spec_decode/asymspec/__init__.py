@@ -33,6 +33,12 @@ from .canonical_driver import (
     AsymSpecCanonicalDraftDriver,
     AsymSpecCanonicalExecutionCounters,
 )
+from .context_causal_policy import (
+    AsymSpecContextCausalDecision,
+    AsymSpecPolicyRow,
+    context_causal_bootstrap_token,
+    decide_context_causal_k2,
+)
 from .draft_forward import (
     AsymSpecDraftForwardResult,
     execute_asymspec_draft_forward,
@@ -110,8 +116,12 @@ __all__ = [
     "AsymSpecFullK2Proposer",
     "AsymSpecDraftForwardResult",
     "AsymSpecDraftSignal",
+    "AsymSpecContextCausalDecision",
+    "AsymSpecPolicyRow",
     "AsymSpecTargetRowCapture",
     "capture_asymspec_verifier_rows",
+    "context_causal_bootstrap_token",
+    "decide_context_causal_k2",
     "DIAGNOSTIC_CANDIDATE_TOKEN_IDS",
     "DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS",
     "DIAGNOSTIC_LIVE_BASE_LAG_TOKENS",

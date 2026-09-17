@@ -4801,11 +4801,14 @@ class GPUModelRunner(
 
         sampler_output: SamplerOutput | None = None
         fixed_acceptance_outcome = None
+        context_causal_outcome = None
+        acceptance_outcome = None
         asymspec_live_spec_token_ids: dict[str, tuple[int, int]] = {}
         if self.speculative_config is not None and (
             self.speculative_config.method == "asymspec"
         ):
             from vllm.v1.spec_decode.asymspec.target_diagnostic import (
+                build_asymspec_context_causal_outcome,
                 build_asymspec_fixed_acceptance_outcome,
                 capture_asymspec_verifier_rows,
                 force_asymspec_diagnostic_decode_outputs,
@@ -4829,6 +4832,21 @@ class GPUModelRunner(
                 requests=self.requests,
                 is_asymspec=True,
             )
+            active_live = getattr(self, "_asymspec_live_iterations", None)
+            if fixed_acceptance_outcome is None:
+                context_causal_outcome = build_asymspec_context_causal_outcome(
+                    scheduler_output=scheduler_output,
+                    spec_decode_metadata=spec_decode_metadata,
+                    logits=logits,
+                    requests=self.requests,
+                    active_live=active_live,
+                    is_asymspec=True,
+                )
+            acceptance_outcome = (
+                fixed_acceptance_outcome
+                if fixed_acceptance_outcome is not None
+                else context_causal_outcome
+            )
             if fixed_acceptance_outcome is not None:
                 cached_request = self.requests[fixed_acceptance_outcome.request_id]
                 cached_request._asymspec_fixed_acceptance_consumed = True
@@ -4838,6 +4856,10 @@ class GPUModelRunner(
                 persist_asymspec_fixed_acceptance_outcome(
                     fixed_acceptance_outcome, self.requests
                 )
+            elif context_causal_outcome is not None:
+                self.requests[
+                    context_causal_outcome.request_id
+                ]._asymspec_context_causal_outcome_consumed = True
             live_capture_request_ids = {
                 request_id
                 for request_id in scheduler_output.scheduled_spec_decode_tokens
@@ -4864,14 +4886,13 @@ class GPUModelRunner(
             # verifier forward.  Candidate rows have already been captured;
             # release only draft-local disposable state before the ordinary
             # sampler chooses a token that this diagnostic ignores.
-            active_live = getattr(self, "_asymspec_live_iterations", None)
             if active_live:
                 for request_id in scheduler_output.scheduled_spec_decode_tokens:
                     runtime = active_live.get(request_id)
                     if runtime is not None:
                         if (
-                            fixed_acceptance_outcome is not None
-                            and fixed_acceptance_outcome.request_id == request_id
+                            acceptance_outcome is not None
+                            and acceptance_outcome.request_id == request_id
                         ):
                             # TARGET has selected its recurrent state and R
                             # from the externally supplied diagnostic outcome.
@@ -4879,22 +4900,20 @@ class GPUModelRunner(
                             # V1 still owns all target bookkeeping below.
                             asymspec_live_spec_token_ids[request_id] = (
                                 runtime.apply_target_outcome(
-                                    accepted_count=(
-                                        fixed_acceptance_outcome.accepted_count
-                                    ),
+                                    accepted_count=(acceptance_outcome.accepted_count),
                                     next_seed_token_id=(
-                                        fixed_acceptance_outcome.next_seed_token_id
+                                        acceptance_outcome.next_seed_token_id
                                     ),
                                 )
                             )
-                            if (not torch.distributed.is_initialized()
-                                    or torch.distributed.get_rank() == 0):
+                            if (
+                                not torch.distributed.is_initialized()
+                                or torch.distributed.get_rank() == 0
+                            ):
                                 runtime.append_outcome_capture(
-                                    accepted_count=(
-                                        fixed_acceptance_outcome.accepted_count
-                                    ),
+                                    accepted_count=(acceptance_outcome.accepted_count),
                                     next_seed_token_id=(
-                                        fixed_acceptance_outcome.next_seed_token_id
+                                        acceptance_outcome.next_seed_token_id
                                     ),
                                 )
                         else:
@@ -4915,13 +4934,13 @@ class GPUModelRunner(
                     raise RuntimeError(
                         "AsymSpec live verifier diagnostic requires sync scheduling."
                     )
-                if fixed_acceptance_outcome is not None:
+                if acceptance_outcome is not None:
                     # Continue below through the unmodified native bookkeeping
                     # path.  The result has the same padded layout as a normal
                     # rejection sampler output, so V1 owns rollback, hybrid
                     # post-processing, output append, and the next seed.
                     sampler_output = SamplerOutput(
-                        sampled_token_ids=fixed_acceptance_outcome.output_token_ids,
+                        sampled_token_ids=acceptance_outcome.output_token_ids,
                         logprobs_tensors=None,
                     )
                 else:
@@ -4941,9 +4960,80 @@ class GPUModelRunner(
                         kv_connector_output=self.kv_connector_output,
                     )
 
+        live_policy_bootstrap: tuple[str, torch.Tensor] | None = None
+        if (
+            sampler_output is None
+            and self.speculative_config is not None
+            and self.speculative_config.method == "asymspec"
+            and spec_decode_metadata is None
+        ):
+            # Frozen C1 bootstrap is defined on the raw prompt-boundary
+            # TARGET row. Preserve it before the ordinary sampler is allowed
+            # to apply any in-place transforms. It is intentionally limited
+            # to the isolated single-request live-policy harness.
+            from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+                DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY,
+                DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
+            )
+
+            candidates = []
+            for request_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests.get(request_id)
+                params = None if request is None else request.sampling_params
+                extra = None if params is None else params.extra_args
+                if (
+                    extra
+                    and extra.get(DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY)
+                    and DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS in extra
+                    and not request.output_token_ids
+                ):
+                    candidates.append(request_id)
+            if candidates:
+                if len(candidates) != 1 or logits is None or logits.shape[0] < 1:
+                    raise RuntimeError(
+                        "AsymSpec C1 bootstrap supports one live prompt request."
+                    )
+                live_policy_bootstrap = (candidates[0], logits[-1].clone())
+
         if sampler_output is None:
             with record_function_or_nullcontext("gpu_model_runner: sample"):
                 sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if live_policy_bootstrap is not None:
+            from vllm.v1.spec_decode.asymspec.live_iteration import (
+                begin_asymspec_live_iteration,
+            )
+
+            request_id, target_logits = live_policy_bootstrap
+            request = self.requests[request_id]
+            request_index = self.input_batch.req_id_to_index.get(request_id)
+            if (
+                request_index is None
+                or sampler_output.sampled_token_ids.shape != (1, 1)
+            ):
+                raise RuntimeError("AsymSpec C1 bootstrap requires one sampled token.")
+            active_live = getattr(self, "_asymspec_live_iterations", None)
+            if active_live is None:
+                active_live = {}
+                self._asymspec_live_iterations = active_live
+            if request_id in active_live:
+                raise RuntimeError("AsymSpec C1 bootstrap already has live state.")
+            runtime = begin_asymspec_live_iteration(
+                runner=self,
+                request=request,
+                seed_token_id=int(sampler_output.sampled_token_ids[request_index, 0]),
+                bootstrap_target_logits=target_logits,
+            )
+            if runtime is None:
+                raise RuntimeError("AsymSpec C1 bootstrap did not create live state.")
+            sampler_output.sampled_token_ids[request_index, 0] = runtime.seed_token_id
+            active_live[request_id] = runtime
+            asymspec_live_spec_token_ids[request_id] = runtime.candidate_token_ids
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                runtime.write_draft_capture()
 
         assert sampler_output is not None
         if self.speculative_config is not None and (
@@ -5139,11 +5229,11 @@ class GPUModelRunner(
                 if runtime is None:
                     continue
                 active_live[request_id] = runtime
-                asymspec_live_spec_token_ids[request_id] = (
-                    runtime.candidate_token_ids
-                )
-                if (not torch.distributed.is_initialized()
-                        or torch.distributed.get_rank() == 0):
+                asymspec_live_spec_token_ids[request_id] = runtime.candidate_token_ids
+                if (
+                    not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                ):
                     runtime.write_draft_capture()
 
         if draft_after_bookkeeping:
@@ -5187,10 +5277,9 @@ class GPUModelRunner(
                 asymspec_live_spec_token_ids=asymspec_live_spec_token_ids,
                 asymspec_fixed_acceptance_counts=(
                     {}
-                    if fixed_acceptance_outcome is None
+                    if acceptance_outcome is None
                     else {
-                        fixed_acceptance_outcome.request_id:
-                        fixed_acceptance_outcome.accepted_count
+                        acceptance_outcome.request_id: acceptance_outcome.accepted_count
                     }
                 ),
                 logprobs=logprobs_lists,

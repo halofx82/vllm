@@ -16,6 +16,9 @@ DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS = "asymspec_live_full_prompt_token_ids"
 DIAGNOSTIC_LIVE_BASE_PROMPT_TOKEN_IDS = "asymspec_live_base_prompt_token_ids"
 DIAGNOSTIC_LIVE_OUTPUT_PATH = "asymspec_live_output_path"
 DIAGNOSTIC_LIVE_BASE_LAG_TOKENS = "asymspec_live_base_lag_tokens"
+# Internal integration mode for the frozen C1/JSD policy.  Capture-only LIVE2
+# requests intentionally omit this key and retain their sampler bypass.
+DIAGNOSTIC_LIVE_CONTEXT_CAUSAL_POLICY = "asymspec_live_context_causal_policy"
 DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS = (
     "asymspec_live_preseed_committed_token_ids"
 )
@@ -113,9 +116,7 @@ def register_asymspec_diagnostic_spec_tokens(
             raise ValueError("AsymSpec live diagnostic is missing required metadata.")
         return True
     if DIAGNOSTIC_CANDIDATE_TOKEN_IDS not in extra_args:
-        if DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT in extra_args:
-            return True
-        return False
+        return DIAGNOSTIC_ARM_AFTER_OUTPUT_COUNT in extra_args
     if request.spec_token_ids or hasattr(
         request, "_asymspec_diagnostic_pending_spec_token_ids"
     ):
@@ -172,7 +173,9 @@ def arm_asymspec_live_spec_tokens(
     )
     if request.num_computed_tokens != expected_computed:
         raise RuntimeError(
-            "AsymSpec live diagnostic must retain exactly one uncomputed seed."
+            "AsymSpec live diagnostic must retain exactly one uncomputed seed: "
+            f"computed={request.num_computed_tokens} expected={expected_computed} "
+            f"prompt={request.num_prompt_tokens} outputs={request.num_output_tokens}."
         )
     request.spec_token_ids = tokens
     request._asymspec_live_seed_token_id = request._output_token_ids[-1]
