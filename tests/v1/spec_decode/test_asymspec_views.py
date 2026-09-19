@@ -881,6 +881,41 @@ def test_deferred_base_long_lag_crosses_attention_blocks():
     state.release()
 
 
+def test_chunked_full_prefill_reuses_reserved_long_context_blocks():
+    """A long FULL prefill may execute in smaller chunks than its reservation.
+
+    This is the SCALE1-shaped case: the request table is reserved for the
+    complete augmented context while the canonical driver advances it one
+    chunk at a time.  A shorter intermediate prefix must not be interpreted
+    as a request to shrink an append-only table.
+    """
+    _, _, _, logical_runtime, _ = _bind_metadata_test_runtime(
+        full_max_model_len=3_200,
+        compressed_max_model_len=1_600,
+    )
+    state = create_asymspec_request_state(
+        request_id="chunked-full-reservation",
+        compressed_prompt_len=1_500,
+        full_prompt_len=3_100,
+        augmentation_offset=1_600,
+        logical_pools=logical_runtime,
+        canonical_prompt_processed=False,
+    )
+    initial = state.block_tables.attention_block_ids(
+        AsymSpecLogicalCacheGroup.FULL_ATTENTION
+    )
+    state.advance_full(800)
+    assert state.block_tables.attention_block_ids(
+        AsymSpecLogicalCacheGroup.FULL_ATTENTION
+    ) == initial
+    state.advance_full(3_100 - 800)
+    assert state.full.canonical_len == 3_100
+    assert state.block_tables.attention_block_ids(
+        AsymSpecLogicalCacheGroup.FULL_ATTENTION
+    ) == initial
+    state.release()
+
+
 def test_base_pair_scorer_reuses_canonical_logits_and_restores_gdn(monkeypatch):
     config, views, bindings, state = _make_canonical_driver_test_state()
     monkeypatch.setattr(

@@ -145,9 +145,11 @@ class AsymSpecRequestBlockTables:
         required_blocks = cdiv(token_count, table.kv_cache_block_size)
         blocks = self.allocated_blocks_by_group[semantic_group]
         additional = required_blocks - len(blocks)
-        if additional < 0:
-            raise ValueError("AsymSpec request block tables are append-only.")
-        if additional:
+        # Request creation reserves the entire prompt capacity before a
+        # chunked prefill begins.  Individual prefill chunks therefore ask
+        # for a shorter prefix of an already append-only table.  That is a
+        # capacity check, not an attempt to shrink the table.
+        if additional > 0:
             blocks.extend(self.pool_by_group[semantic_group].get_new_blocks(additional))
             table.add_row([block.block_id for block in blocks], row_idx=0)
 
