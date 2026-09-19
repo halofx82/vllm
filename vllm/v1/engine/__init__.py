@@ -222,6 +222,10 @@ class EngineCoreOutput(
 
     new_sampling_mask: SamplingMaskLists | None = None
 
+    # Internal only. OpenAI AsymSpec serving consumes this before it builds a
+    # public response, so it is never part of an OpenAI response schema.
+    asymspec_evidence_carrier_record: dict[str, Any] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

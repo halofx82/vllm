@@ -39,6 +39,9 @@ DIAGNOSTIC_FORCED_DECODE_TOKEN_IDS = (
 # supplies this rank-zero artifact destination; workers never own messages or
 # construct the final target-only request.
 EVIDENCE_CARRIER_OUTPUT_PATH = "asymspec_evidence_carrier_output_path"
+# Internal serving handoff; unlike the historical artifact path this is
+# returned through V1's normal output transport and is never client input.
+EVIDENCE_CARRIER_IN_MEMORY = "asymspec_evidence_carrier_in_memory"
 ASYMSPEC_EXECUTION_MODE = "asymspec_execution_mode"
 ASYMSPEC_TARGET_ONLY_EXECUTION_MODE = "target_only"
 

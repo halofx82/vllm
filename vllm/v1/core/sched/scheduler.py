@@ -1757,6 +1757,9 @@ class Scheduler(SchedulerInterface):
         asymspec_live_capture_complete = (
             model_runner_output.asymspec_live_capture_complete
         )
+        asymspec_evidence_carrier_records = (
+            model_runner_output.asymspec_evidence_carrier_records
+        )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1839,6 +1842,8 @@ class Scheduler(SchedulerInterface):
                 and (
                     "asymspec_live_full_prompt_token_ids"
                     in request.sampling_params.extra_args
+                    or "asymspec_evidence_carrier_in_memory"
+                    in request.sampling_params.extra_args
                     or "asymspec_diagnostic_target_control_output_path"
                     in request.sampling_params.extra_args
                 )
@@ -1867,6 +1872,9 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
+                        asymspec_evidence_carrier_record=(
+                            asymspec_evidence_carrier_records.get(req_id)
+                        ),
                     )
                 )
                 continue

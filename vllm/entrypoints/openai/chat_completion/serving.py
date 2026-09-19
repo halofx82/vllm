@@ -71,6 +71,15 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
+from vllm.v1.spec_decode.asymspec.evidence_transfer import (
+    evidence_wrapper,
+    select_evidence,
+)
+from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+    ASYMSPEC_EXECUTION_MODE,
+    ASYMSPEC_TARGET_ONLY_EXECUTION_MODE,
+    EVIDENCE_CARRIER_IN_MEMORY,
+)
 
 logger = init_logger(__name__)
 
@@ -83,6 +92,10 @@ class _AsymSpecChatInputs:
     engine_input: EngineInput
     full_prompt_token_ids: list[int]
     max_tokens: int
+
+
+_ASYMSPEC_SERVING_TARGET_ONLY = "target_only"
+_ASYMSPEC_SERVING_C1_FALLBACK = "c1_fallback"
 
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
@@ -192,6 +205,10 @@ class OpenAIServingChat(GenerateBaseServing):
             self._speculative_config is not None
             and self._speculative_config.method == "asymspec"
         )
+        # Frozen's physical FULL/BASE draft pools are BS=1.  This slot guards
+        # only that hidden carrier/C1 work; target-only final requests can run
+        # after the carrier has released it.
+        self._asymspec_slot = asyncio.Semaphore(1)
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -390,7 +407,18 @@ class OpenAIServingChat(GenerateBaseServing):
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
+        *,
+        asymspec_stage: str | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        if (
+            self._asymspec_enabled
+            and self._speculative_config is not None
+            and self._speculative_config.asymspec_evidence_mode == "one_shot"
+            and asymspec_stage is None
+        ):
+            return await self._create_asymspec_evidence_completion(
+                request, raw_request
+            )
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -484,6 +512,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     sampling_params.extra_args[RESERVED_EXTRA_ARG] = (
                         asymspec_inputs.full_prompt_token_ids
                     )
+                    if asymspec_stage == _ASYMSPEC_SERVING_TARGET_ONLY:
+                        sampling_params.extra_args[ASYMSPEC_EXECUTION_MODE] = (
+                            ASYMSPEC_TARGET_ONLY_EXECUTION_MODE
+                        )
 
             self._log_inputs(
                 sub_request_id,
@@ -566,6 +598,97 @@ class OpenAIServingChat(GenerateBaseServing):
             request_metadata,
             parser=parser,
             mm_token_counts=mm_token_counts,
+        )
+
+    async def _create_asymspec_evidence_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        """Serve frozen's two-request evidence workflow without client API.
+
+        The carrier's compact record crosses the normal V1 output boundary;
+        message ownership, attribution, and the fresh final request remain in
+        this serving process.
+        """
+        rendered = await self._render_asymspec_chat_request(request)
+        if isinstance(rendered, ErrorResponse):
+            return rendered
+        if request.use_beam_search:
+            return self.online_renderer.create_error_response(
+                "AsymSpec evidence serving does not support beam search"
+            )
+        carrier_params = request.to_sampling_params(
+            1, self.default_sampling_params
+        )
+        carrier_params.extra_args = dict(carrier_params.extra_args or {})
+        carrier_params.extra_args.update(
+            {
+                RESERVED_EXTRA_ARG: rendered.full_prompt_token_ids,
+                EVIDENCE_CARRIER_IN_MEMORY: True,
+            }
+        )
+        carrier_base_id = self._base_request_id(raw_request, request.request_id)
+        carrier_id = f"chatcmpl-{carrier_base_id}-carrier"
+        lora_request = self._maybe_get_adapters(
+            request, supports_default_mm_loras=True
+        )
+        async with self._asymspec_slot:
+            carrier = self.engine_client.generate(
+                rendered.engine_input,
+                carrier_params,
+                carrier_id,
+                lora_request=lora_request,
+                priority=self._get_priority(request, raw_request),
+            )
+            record: dict[str, object] | None = None
+            try:
+                async for output in carrier:
+                    record = getattr(output, "asymspec_evidence_carrier_record", None)
+                    if record is not None:
+                        break
+            finally:
+                await carrier.aclose()
+        if record is None:
+            return self.online_renderer.create_error_response(
+                "AsymSpec evidence carrier finished without a record"
+            )
+        evidence = select_evidence(
+            record["rollouts"],
+            full_top2=record["full_top2"],
+            full_source_ids=rendered.full_prompt_token_ids,
+            base_source_ids=list(
+                self._extract_prompt_components(rendered.engine_input).token_ids or []
+            ),
+        )
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        visible = []
+        for token in evidence.selected_token_ids:
+            if token in tokenizer.all_special_ids:
+                break
+            visible.append(token)
+        evidence_text = tokenizer.decode(visible).strip()
+        if evidence.attribution_pass and evidence_text:
+            messages = [dict(message) for message in request.messages]
+            if not messages or messages[-1].get("role") != "user":
+                return self.online_renderer.create_error_response(
+                    "AsymSpec evidence requires a final user message"
+                )
+            messages.insert(
+                -1, {"role": "user", "content": evidence_wrapper(evidence_text)}
+            )
+            final_request = request.model_copy(
+                deep=True, update={"messages": messages}
+            )
+            final_stage = _ASYMSPEC_SERVING_TARGET_ONLY
+        else:
+            # Frozen failure behavior is ordinary production C1, not a
+            # target-only no-evidence request.
+            final_request = request
+            final_stage = _ASYMSPEC_SERVING_C1_FALLBACK
+        return await self._create_chat_completion(
+            final_request, raw_request, asymspec_stage=final_stage
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:

@@ -335,6 +335,11 @@ class ModelRunnerOutput:
     # populate this field.
     asymspec_fixed_acceptance_counts: dict[str, int] = field(default_factory=dict)
 
+    # Compact JSON-compatible carrier payloads for the OpenAI serving layer.
+    asymspec_evidence_carrier_records: dict[str, dict[str, object]] = field(
+        default_factory=dict
+    )
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

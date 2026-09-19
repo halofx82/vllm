@@ -4990,6 +4990,7 @@ class GPUModelRunner(
                     )
 
         live_policy_bootstrap: list[tuple[str, torch.Tensor]] = []
+        asymspec_evidence_carrier_records: dict[str, dict[str, object]] = {}
         if (
             sampler_output is None
             and self.speculative_config is not None
@@ -5074,11 +5075,35 @@ class GPUModelRunner(
                 )
                 active_live[request_id] = runtime
                 asymspec_live_spec_token_ids[request_id] = runtime.candidate_token_ids
+                from vllm.v1.spec_decode.asymspec.verifier_bridge import (
+                    EVIDENCE_CARRIER_IN_MEMORY,
+                )
+                extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+                if extra_args.get(EVIDENCE_CARRIER_IN_MEMORY):
+                    if runtime.evidence_carrier_record is None:
+                        raise RuntimeError(
+                            "AsymSpec serving carrier did not capture evidence."
+                        )
+                    asymspec_evidence_carrier_records[request_id] = (
+                        runtime.evidence_carrier_record.json()
+                    )
                 if (
                     not torch.distributed.is_initialized()
                     or torch.distributed.get_rank() == 0
                 ):
                     runtime.write_draft_capture()
+
+            if asymspec_evidence_carrier_records:
+                return ModelRunnerOutput(
+                    req_ids=self.input_batch.req_ids.copy(),
+                    req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                    sampled_token_ids=[[] for _ in range(self.input_batch.num_reqs)],
+                    asymspec_live_capture_complete=set(
+                        asymspec_evidence_carrier_records
+                    ),
+                    asymspec_evidence_carrier_records=asymspec_evidence_carrier_records,
+                    kv_connector_output=self.kv_connector_output,
+                )
 
         assert sampler_output is not None
         if self.speculative_config is not None and (
@@ -5327,6 +5352,7 @@ class GPUModelRunner(
                         acceptance_outcome.request_id: acceptance_outcome.accepted_count
                     }
                 ),
+                asymspec_evidence_carrier_records=asymspec_evidence_carrier_records,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,

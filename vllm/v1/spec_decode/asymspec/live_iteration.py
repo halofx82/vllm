@@ -47,6 +47,7 @@ from .verifier_bridge import (
     DIAGNOSTIC_LIVE_FULL_PROMPT_TOKEN_IDS,
     DIAGNOSTIC_LIVE_OUTPUT_PATH,
     DIAGNOSTIC_LIVE_PRESEED_COMMITTED_TOKEN_IDS,
+    EVIDENCE_CARRIER_IN_MEMORY,
     EVIDENCE_CARRIER_OUTPUT_PATH,
 )
 from .views import AsymSpecViewRole
@@ -507,7 +508,7 @@ def begin_asymspec_live_iteration(
     if (
         speculative_config is not None
         and speculative_config.asymspec_evidence_mode == "one_shot"
-        and carrier_path
+        and (carrier_path or extra_args.get(EVIDENCE_CARRIER_IN_MEMORY))
     ):
         # Frozen Step-51 captures before bootstrap C1 mutates the seed.  The
         # resulting branch state is fully restored before normal production

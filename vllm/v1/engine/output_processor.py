@@ -686,6 +686,10 @@ class OutputProcessor:
                 kv_transfer_params,
                 ec_transfer_params,
             ):
+                if engine_core_output.asymspec_evidence_carrier_record is not None:
+                    request_output.asymspec_evidence_carrier_record = (
+                        engine_core_output.asymspec_evidence_carrier_record
+                    )
                 if req_state.streaming_input:
                     request_output.finished = False
 
