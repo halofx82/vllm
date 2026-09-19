@@ -9,6 +9,7 @@ V1 path; diagnostic capture and fixed-outcome control are optional overlays.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,8 +28,10 @@ from .cache_plan import (
 )
 from .canonical_driver import AsymSpecCanonicalDraftDriver
 from .context_causal_policy import context_causal_bootstrap_token
+from .draft_forward import execute_asymspec_dual_view_forward
 from .draft_signal import AsymSpecDraftSignal, build_asymspec_draft_signal
 from .evidence_rollout import AsymSpecEvidenceCarrierRecord, AsymSpecEvidenceRollout
+from .execution_metadata import build_asymspec_view_execution_metadata
 from .logical_cache import (
     AsymSpecLogicalBlockPoolRuntime,
     build_asymspec_logical_cache_plan,
@@ -240,21 +243,18 @@ class AsymSpecLiveIterationRuntime:
             self.proposal.transaction.promote(accepted_count)
             self.full_promoted_tokens += accepted_count
             self.full_rollbacks += int(accepted_count == 0)
-        self.full.commit_token(next_seed_token_id)
-
-        # BASE scores A only disposably.  Every accepted token and R therefore
-        # enters via the proven authoritative deferred queue before one packed
-        # canonical catch-up forward.
         pending_before_seed = len(self.request_state.base.pending_token_ids)
-        base_suffix = (
-            (int(next_seed_token_id),)
-            if self._full_accept_bonus_prepared
-            else (*accepted, int(next_seed_token_id))
-        )
-        for token_id in base_suffix:
-            self.base.observe_committed_token(token_id)
+        base_suffix = ((int(next_seed_token_id),) if self._full_accept_bonus_prepared
+                       else (*accepted, int(next_seed_token_id)))
+        if os.environ.get("ASYMSPEC_DUAL_VIEW_BATCH", "0") == "1":
+            _dual_authoritative_update(
+                self.full, self.base, base_suffix, int(next_seed_token_id))
+        else:
+            self.full.commit_token(next_seed_token_id)
+            for token_id in base_suffix:
+                self.base.observe_committed_token(token_id)
+            self.base.catch_up_base()
         self.base_authoritative_tokens_observed += len(base_suffix)
-        self.base.catch_up_base()
         self.base_catch_up_tokens += pending_before_seed + len(base_suffix)
         if self.request_state.base.pending_token_ids:
             raise AssertionError("AsymSpec BASE pending queue survived outcome.")
@@ -264,10 +264,8 @@ class AsymSpecLiveIterationRuntime:
         if self.full.canonical_len != expected_full_len:
             raise AssertionError("AsymSpec FULL/BASE canonical coordinates diverged.")
 
-        self.proposal = AsymSpecFullK2Proposer(self.full).propose_k2()
-        self.base_score = AsymSpecBasePairScorer(self.base).score_pair(
-            self.proposal.candidate_token_ids
-        )
+        self.proposal, self.base_score = _propose_and_score(
+            self.full, self.base)
         self.signal = build_asymspec_draft_signal(
             candidate_token_ids=self.proposal.candidate_token_ids,
             a0=self.proposal.canonical_result.logits[0],
@@ -415,6 +413,64 @@ def _live_prompt_ids(
     return compressed_ids, compressed_ids.copy(), [], "", 0
 
 
+def _propose_and_score(
+    full: AsymSpecCanonicalDraftDriver,
+    base: AsymSpecCanonicalDraftDriver,
+) -> tuple[AsymSpecFullK2Proposal, AsymSpecBasePairScore]:
+    """Run the frozen inner dual-view candidate stage when enabled."""
+    proposer = AsymSpecFullK2Proposer(full)
+    if os.environ.get("ASYMSPEC_DUAL_VIEW_BATCH", "0") == "1":
+        return proposer.propose_k2_dual(base)
+    proposal = proposer.propose_k2()
+    return proposal, AsymSpecBasePairScorer(base).score_pair(
+        proposal.candidate_token_ids)
+
+
+@torch.no_grad()
+def _dual_authoritative_update(
+    full: AsymSpecCanonicalDraftDriver,
+    base: AsymSpecCanonicalDraftDriver,
+    base_tokens: tuple[int, ...],
+    full_token: int,
+) -> None:
+    """Apply one authoritative FULL token and BASE pending range together."""
+    for token in base_tokens:
+        base.observe_committed_token(token)
+    pending = tuple(base.request_state.base.pending_token_ids)
+    full_start = full.canonical_len
+    base_start = base.canonical_len
+    full._ensure_attention_capacity(full_start + 1)
+    base._ensure_attention_capacity(base_start + len(base_tokens))
+    common = dict(
+        request_state=full.request_state, views=full.views,
+        cache_bindings=full.cache_bindings, vllm_config=full.vllm_config,
+        allow_uncommitted_end=True, allow_uncommitted_start=True,
+        device=full.device)
+    full_meta = build_asymspec_view_execution_metadata(
+        role=AsymSpecViewRole.FULL, query_start=full_start,
+        canonical_end=full_start, query_len=1, **common)
+    base_meta = build_asymspec_view_execution_metadata(
+        role=AsymSpecViewRole.BASE, query_start=base_start,
+        canonical_end=base_start, query_len=len(pending), **common)
+    full_result, base_result = execute_asymspec_dual_view_forward(
+        full_input_ids=torch.tensor([full_token], dtype=torch.int32,
+                                    device=full.device),
+        base_input_ids=torch.tensor(pending, dtype=torch.int32,
+                                    device=base.device),
+        full_metadata=full_meta, base_metadata=base_meta,
+        views=full.views, cache_bindings=full.cache_bindings)
+    full._advance(1)
+    full._set_last_result(full_result)
+    full.counters.incremental_forward_calls += 1
+    full.counters.incremental_tokens_processed += 1
+    committed = base.request_state.catch_up_base()
+    if tuple(committed) != pending:
+        raise AssertionError("AsymSpec dual BASE queue changed during catch-up")
+    base._set_last_result(base_result)
+    base.counters.catch_up_forward_calls += 1
+    base.counters.catch_up_tokens_processed += len(pending)
+
+
 @torch.no_grad()
 def begin_asymspec_live_iteration(
     *,
@@ -553,8 +609,7 @@ def begin_asymspec_live_iteration(
     # canonical in both compressed views.
     if not base_lag:
         base.begin_deferred_base()
-    proposal = AsymSpecFullK2Proposer(full).propose_k2()
-    base_score = AsymSpecBasePairScorer(base).score_pair(proposal.candidate_token_ids)
+    proposal, base_score = _propose_and_score(full, base)
     signal = build_asymspec_draft_signal(
         candidate_token_ids=proposal.candidate_token_ids,
         a0=proposal.canonical_result.logits[0],
