@@ -422,7 +422,11 @@ class Qwen3_5ForCausalLMBase(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            # Qwen3.5 VLM checkpoints include a visual tower. Text-only
+            # consumers (including the external AsymSpec FULL/BASE tree)
+            # intentionally instantiate only the language model, so those
+            # unrelated tensors must not be presented to its loader.
+            skip_prefixes=["mtp.", "model.visual."],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 

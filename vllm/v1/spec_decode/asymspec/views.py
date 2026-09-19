@@ -20,6 +20,7 @@ from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import initialize_model
+from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from .hybrid import AsymSpecHybridStateSpec, describe_qwen3_5_hybrid_state
@@ -85,6 +86,26 @@ def share_model_state(full: nn.Module, base: nn.Module) -> tuple[int, int]:
     """
     full_params = dict(full.named_parameters(remove_duplicate=False))
     base_params = dict(base.named_parameters(remove_duplicate=False))
+    # Compressed-tensors creates temporary q/k/v scale and zero-point
+    # Parameters while constructing a model, then FULL's post-load hook
+    # promotes the scales to private runtime fields and deletes the
+    # placeholders. BASE is intentionally meta-constructed, so it retains
+    # only those transient placeholders. Remove exactly that known temporary
+    # form before aliasing the post-load FULL state below.
+    for name in base_params.keys() - full_params.keys():
+        parent, leaf = _module_and_leaf(base, name)
+        full_parent, _ = _module_and_leaf(full, name)
+        if leaf in {"q_zero_point", "k_zero_point", "v_zero_point"} or (
+            leaf in {"q_scale", "k_scale", "v_scale"}
+            and hasattr(full_parent, f"_{leaf}")
+        ):
+            delattr(parent, leaf)
+    base_params = dict(base.named_parameters(remove_duplicate=False))
+    for name, full_param in full_params.items():
+        if name not in base_params:
+            parent, leaf = _module_and_leaf(base, name)
+            setattr(parent, leaf, full_param)
+    base_params = dict(base.named_parameters(remove_duplicate=False))
     if full_params.keys() != base_params.keys():
         mismatch = sorted(full_params.keys() ^ base_params.keys())[:16]
         raise RuntimeError("AsymSpec FULL/BASE parameter layouts differ: "
@@ -94,23 +115,29 @@ def share_model_state(full: nn.Module, base: nn.Module) -> tuple[int, int]:
     seen_params: set[int] = set()
     for name, full_param in full_params.items():
         parent, leaf = _module_and_leaf(base, name)
-        parent._parameters[leaf] = full_param
+        setattr(parent, leaf, full_param)
         if id(full_param) not in seen_params:
             parameter_bytes += full_param.numel() * full_param.element_size()
             seen_params.add(id(full_param))
 
     full_buffers = dict(full.named_buffers(remove_duplicate=False))
     base_buffers = dict(base.named_buffers(remove_duplicate=False))
+    for name, full_buffer in full_buffers.items():
+        if name not in base_buffers:
+            parent, leaf = _module_and_leaf(base, name)
+            setattr(parent, leaf, full_buffer)
+    base_buffers = dict(base.named_buffers(remove_duplicate=False))
     if full_buffers.keys() != base_buffers.keys():
-        mismatch = sorted(full_buffers.keys() ^ base_buffers.keys())[:16]
+        only_full = sorted(full_buffers.keys() - base_buffers.keys())[:32]
+        only_base = sorted(base_buffers.keys() - full_buffers.keys())[:32]
         raise RuntimeError("AsymSpec FULL/BASE buffer layouts differ: "
-                           f"{mismatch!r}")
+                           f"only_full={only_full!r}, only_base={only_base!r}")
 
     buffer_bytes = 0
     seen_buffers: set[int] = set()
     for name, full_buffer in full_buffers.items():
         parent, leaf = _module_and_leaf(base, name)
-        parent._buffers[leaf] = full_buffer
+        setattr(parent, leaf, full_buffer)
         if id(full_buffer) not in seen_buffers:
             buffer_bytes += full_buffer.numel() * full_buffer.element_size()
             seen_buffers.add(id(full_buffer))
@@ -185,7 +212,15 @@ class AsymSpecDraftViews:
             )
         draft_vllm_config = replace(
             self.vllm_config,
-            quant_config=None,
+            # The draft has an independent checkpoint and must use its own
+            # quantization scheme, never the TARGET's.  This also keeps the
+            # meta-constructed BASE tree structurally identical to FULL when
+            # the external draft is dynamically quantized.
+            quant_config=(
+                get_draft_quant_config(self.vllm_config)
+                if hasattr(self.vllm_config, "load_config")
+                else None
+            ),
             cache_config=draft_cache_config,
             # Real VllmConfig construction must avoid recursively applying the
             # TARGET-only align policy. Synthetic fixtures retain their
